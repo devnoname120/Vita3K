@@ -20,6 +20,25 @@
 #include <mem/util.h>
 
 #include <gtest/gtest.h>
+#include <mem/state.h>
+
+TEST(guest_memory, fixed_low_pages_do_not_inherit_host_null_reservation) {
+    MemState state;
+    ASSERT_TRUE(init(state, true));
+    ASSERT_FALSE(is_valid_addr(state, 0));
+    ASSERT_EQ(try_alloc_at(state, 0x1000, 0x1000, "low-text"), 0x1000u);
+    ASSERT_EQ(try_alloc_at(state, 0x2000, 0x1000, "low-data"), 0x2000u);
+    state.memory[0x1000] = 0x31;
+    state.memory[0x2000] = 0x52;
+    ASSERT_EQ(try_alloc_at(state, 0x1000, 0x1000, "collision"), 0u);
+    free(state, 0x1000);
+    EXPECT_EQ(state.memory[0x2000], 0x52);
+    ASSERT_EQ(try_alloc_at(state, 0x1000, 0x1000, "low-text-again"), 0x1000u);
+    EXPECT_EQ(state.memory[0x1000], 0);
+    EXPECT_EQ(state.memory[0x2000], 0x52);
+    free(state, 0x1000);
+    free(state, 0x2000);
+}
 
 TEST(bitmap_allocator, one_bit_allocation) {
     BitmapAllocator allocator(KiB(5));

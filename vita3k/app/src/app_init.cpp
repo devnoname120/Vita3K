@@ -280,6 +280,12 @@ bool init_paths(Root &root_paths) {
     }
 #endif
 
+    // A separate runtime keeps local test builds out of the user's normal storage.
+    if (const char *runtime_path = getenv("VITA3K_PORTABLE_DIR"); runtime_path && *runtime_path) {
+        portable_path = fs_utils::utf8_to_path(runtime_path);
+        fs::create_directories(portable_path);
+    }
+
     if (fs::is_directory(portable_path)) {
         portable = true;
         // If a portable directory exists, use it for everything else.

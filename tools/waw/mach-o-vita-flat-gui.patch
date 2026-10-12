@@ -1,0 +1,13 @@
+--- a/source/ios/gl_bridge.c
++++ b/source/ios/gl_bridge.c
+@@ -8,2 +8,3 @@
+ #include "ios/native_guest.h"
++#include "objc/runtime.h"
+ #include "utils/file.h"
+@@ -433,2 +434,6 @@
+     g_gl_initialized = 1;
++#if !ML_ENABLE_TTBR_REMAP_NATIVE_RUNNER
++    /* Flat execution has no TTBR bootstrap gate to install the GUI canvas fix. */
++    ml_objc_prepare_native_gui();
++#endif
+     ml_info("IOS_GL_READY %ux%u", ML_IOS_GL_WIDTH, ML_IOS_GL_HEIGHT);

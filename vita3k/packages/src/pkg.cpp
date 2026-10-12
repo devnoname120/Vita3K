@@ -50,10 +50,20 @@ static void ctr_init(uint8_t *counter, uint8_t *iv, uint64_t n) {
     }
 }
 
-static int execute(std::string &zrif, fs::path &title_src, fs::path &title_dst, F00DEncryptorTypes type, std::string &f00d_arg, PfsProgressCallback progress = nullptr) {
+using InstallPfsProgressCallback = std::function<void(std::uint64_t, std::uint64_t, const std::string &)>;
+
+template <typename Progress = InstallPfsProgressCallback>
+static int execute(std::string &zrif, fs::path &title_src, fs::path &title_dst, F00DEncryptorTypes type, std::string &f00d_arg, Progress progress = {}) {
     std::string title_src_str = title_src.string();
     std::string title_dst_str = title_dst.string();
-    return execute(zrif, title_src_str, title_dst_str, type, f00d_arg, progress);
+    if constexpr (requires { execute(zrif, title_src_str, title_dst_str, type, f00d_arg, progress); }) {
+        return execute(zrif, title_src_str, title_dst_str, type, f00d_arg, progress);
+    } else {
+        const int result = execute(zrif, title_src_str, title_dst_str, type, f00d_arg);
+        if (result >= 0 && progress)
+            progress(1, 1, {});
+        return result;
+    }
 }
 
 bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, const fs::path &title_path, const std::function<void(float)> &progress_callback) {
@@ -64,7 +74,7 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
     F00DEncryptorTypes f00d_enc_type = F00DEncryptorTypes::native;
     std::string f00d_arg = std::string();
 
-    PfsProgressCallback pfs_progress = nullptr;
+    InstallPfsProgressCallback pfs_progress = nullptr;
     if (progress_callback) {
         pfs_progress = [&progress_callback](std::uint64_t processed, std::uint64_t total, const std::string &) {
             progress_callback(total ? static_cast<float>(processed) / static_cast<float>(total) : 1.f);

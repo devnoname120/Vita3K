@@ -302,7 +302,7 @@ if(APPLE)
 		POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${discord_dylib}" "$<TARGET_FILE_DIR:vita3k>/../Resources")
 	endif()
-	set_target_properties(vita3k PROPERTIES LINK_FLAGS "-rpath @loader_path/../Frameworks/ -rpath @loader_path/../Resources/ -ld64")
+	set_target_properties(vita3k PROPERTIES LINK_FLAGS "-rpath @loader_path/../Frameworks/ -rpath @loader_path/../Resources/")
 	target_sources(vita3k PRIVATE Vita3K.icns)
 	set(MACOSX_BUNDLE_ICON_FILE Vita3K.icns)
 	set(MACOSX_BUNDLE_GUI_IDENTIFIER "com.github.Vita3K.Vita3K")
@@ -313,15 +313,18 @@ if(APPLE)
 	set_source_files_properties(${MOLTENVK_DYLIB} PROPERTIES MACOSX_PACKAGE_LOCATION Frameworks)
 
 	qt_finalize_target(vita3k)
-	if(MACDEPLOYQT_EXECUTABLE)
-		add_custom_command(TARGET vita3k POST_BUILD
-			COMMAND "${MACDEPLOYQT_EXECUTABLE}" "$<TARGET_FILE_DIR:vita3k>/../.." "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>")
-	endif()
+	option(VITA3K_BUNDLE_QT "Bundle Qt frameworks and sign the intermediate macOS app" ON)
+	if(VITA3K_BUNDLE_QT)
+		if(MACDEPLOYQT_EXECUTABLE)
+			add_custom_command(TARGET vita3k POST_BUILD
+				COMMAND "${MACDEPLOYQT_EXECUTABLE}" "$<TARGET_FILE_DIR:vita3k>/../.." "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>" -always-overwrite)
+		endif()
 
-	add_custom_command(
-		TARGET vita3k
-		POST_BUILD
-		COMMAND codesign --force --deep --preserve-metadata=entitlements,requirements,flags,runtime --sign - "$<TARGET_FILE_DIR:vita3k>/../..")
+		add_custom_command(
+			TARGET vita3k
+			POST_BUILD
+			COMMAND codesign --force --deep --preserve-metadata=entitlements,requirements,flags,runtime --sign - "$<TARGET_FILE_DIR:vita3k>/../..")
+	endif()
 elseif(LINUX)
 	include("${CMAKE_SOURCE_DIR}/cmake/generate_metainfo.cmake")
 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath='$ORIGIN'")

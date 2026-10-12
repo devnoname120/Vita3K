@@ -100,6 +100,7 @@ EXPORT(SceInt32, _sceAppMgrAppParamGetString, int pid, int param, char *string, 
             return RET_ERROR(SCE_APPMGR_ERROR_INVALID_PARAMETER2);
 
         res.copy(string, size);
+        string[res.size()] = '\0';
         return 0;
     }
 }

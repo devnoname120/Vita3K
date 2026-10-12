@@ -22,6 +22,7 @@
 // Vita3K's memory system.
 
 #include <module/module.h>
+#include "../SceSysmem/SceSysmemForDriver.h"
 
 #include <cpu/functions.h>
 #include <kernel/state.h>
@@ -231,4 +232,28 @@ EXPORT(void, kuKernelReleaseExceptionHandler, uint32_t exceptionType) {
         const Address old = emuenv.kernel.exception_handlers[exceptionType].exchange(0);
         LOG_INFO("kuKernelReleaseExceptionHandler: type={} old=0x{:08X}", exceptionType, old);
     }
+}
+
+// Fixed guest mappings are emulator allocations, not host or firmware mappings.
+EXPORT(SceUID, kuKernelAllocMemBlock, const char *name, SceKernelMemBlockType type,
+    SceSize size, SceKernelAllocMemBlockKernelOpt *opt) {
+    return CALL_EXPORT(ksceKernelAllocMemBlock, name, type, size, opt);
+}
+
+EXPORT(int, kuKernelCpuUnrestrictedMemcpy, Ptr<void> destination, Ptr<const void> source, SceSize size) {
+    if (size == 0)
+        return 0;
+    const uint64_t dst_end = uint64_t(destination.address()) + size;
+    const uint64_t src_end = uint64_t(source.address()) + size;
+    if (!destination || !source || dst_end > UINT32_MAX || src_end > UINT32_MAX
+        || !is_valid_addr_range(emuenv.mem, destination.address(), Address(dst_end))
+        || !is_valid_addr_range(emuenv.mem, source.address(), Address(src_end)))
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    std::memmove(destination.get(emuenv.mem), source.get(emuenv.mem), size);
+    return 0;
+}
+
+EXPORT(int, kuKernelFlushCaches, Address address, SceSize size) {
+    emuenv.kernel.invalidate_jit_cache(address, size);
+    return 0;
 }

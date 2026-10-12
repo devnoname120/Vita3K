@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include "frame_host.h"
+#include "../../interface.h"
 
 #include <sdl-frontend/session.h>
 
@@ -34,6 +35,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -287,6 +289,11 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
         LOG_INFO("Game started: {} ({})", emuenv.current_app_title, launch_request.app_path);
         app::LaunchRuntimeMetrics runtime_metrics{};
 
+        const char *capture_setting = std::getenv("VITA3K_WAW_CAPTURE");
+        const bool capture_frames = launch_request.app_path == "WAW000001" &&
+            capture_setting && std::strcmp(capture_setting, "1") == 0;
+        uint64_t next_capture_tick = SDL_GetTicks() + 5000;
+        unsigned captured_frames = 0;
         bool running = !pending_launch_request.has_value();
         while (running) {
             SDL_Event event;
@@ -360,6 +367,13 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
 
             if (!session.is_running())
                 running = false;
+
+            // Capture emulator output without relying on host desktop permissions.
+            if (running && capture_frames && captured_frames < 24 && SDL_GetTicks() >= next_capture_tick) {
+                take_screenshot(emuenv);
+                ++captured_frames;
+                next_capture_tick = SDL_GetTicks() + 5000;
+            }
 
             if (running)
                 SDL_Delay(16);

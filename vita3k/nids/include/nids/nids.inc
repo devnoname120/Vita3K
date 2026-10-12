@@ -7753,3 +7753,8 @@ NID(sceWlanGetWakeOnTargetProcess, 0x18E6AFB2)
 NID(sceWlanRegisterCallback, 0xAA2E46F6)
 NID(sceWlanSetConfiguration, 0xDBE8AEF2)
 NID(sceWlanUnregisterCallback, 0x826DC04F)
+
+// Module "kubridge": flat-address HLE support for homebrew loaders.
+NID(kuKernelAllocMemBlock, 0x2EF7C290)
+NID(kuKernelFlushCaches, 0x38B70744)
+NID(kuKernelCpuUnrestrictedMemcpy, 0x91D9CABC)

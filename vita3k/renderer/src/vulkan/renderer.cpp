@@ -421,6 +421,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 #endif
         };
         bool has_layer_settings_extension = false;
+        bool has_portability_extension = false;
         for (const vk::ExtensionProperties &prop : vk::enumerateInstanceExtensionProperties()) {
             auto ite = optional_instance_extensions.find(prop.extensionName);
             if (ite != optional_instance_extensions.end()) {
@@ -428,9 +429,19 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 #ifdef __APPLE__
                 if (*ite == vk::EXTLayerSettingsExtensionName)
                     has_layer_settings_extension = true;
+                if (*ite == vk::KHRPortabilityEnumerationExtensionName)
+                    has_portability_extension = true;
 #endif
             }
         }
+#ifdef __APPLE__
+        // SDL can request this loader extension even when a directly loaded ICD lacks it.
+        std::erase_if(instance_extensions, [](const char *name) {
+            return std::string_view(name) == vk::KHRPortabilityEnumerationExtensionName;
+        });
+        if (has_portability_extension)
+            instance_extensions.push_back(vk::KHRPortabilityEnumerationExtensionName);
+#endif
 
         // look if we can use the validation layer
         bool has_validation_layer = false;
@@ -492,8 +503,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 
         vk::InstanceCreateInfo instance_info{
 #ifdef __APPLE__
-            .flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
             .pNext = instance_create_pnext,
+            .flags = has_portability_extension ? vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR : vk::InstanceCreateFlags{},
 #endif
             .pApplicationInfo = &app_info,
         };

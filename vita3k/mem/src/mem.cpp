@@ -111,7 +111,8 @@ bool init(MemState &state, const bool use_page_table) {
     };
     register_access_violation_handler(handler);
 
-    const Address null_address = alloc_inner(state, 0, state.host_page_size / STANDARD_PAGE_SIZE, "null", true);
+    // Host protection granularity must not consume valid low guest pages.
+    const Address null_address = alloc_inner(state, 0, 1, "null", true);
     assert(null_address == 0);
 #ifdef _WIN32
     DWORD old_protect = 0;
