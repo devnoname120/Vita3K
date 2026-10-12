@@ -159,6 +159,49 @@ controller reader, with the real configuration/controller types and controlled
 SDL keyboard state. It covers presses/releases, primary and alternate bindings,
 both sticks, focus changes, text-entry suppression and input-array bounds.
 
-BioShock gameplay is not yet validated: selecting New Game now works and the
-intro finishes, but a black screen is reported afterward. Loading/UI activity
-continues; its cause remains under investigation independently of menu controls.
+The subsequent black-world rendering issue was traced to the flat port's GL
+stack validation, not keyboard input or movie playback. Its companion fix is
+required for BioShock rendering as described below.
+
+## Required flat BioShock stack validation
+
+`mach-o-vita-flat-gl-stack.patch` applies to the separate `mach-o-vita` port,
+not Vita3K's renderer. In the flat BioShock configuration, disabling the TTBR
+runner also disabled recognition of ordinary thread-stack pointers. Valid
+shader-source arrays and query outputs were rejected before reaching VitaGL;
+program linking failed while the independent movie and text paths still drew.
+
+The patch obtains the current thread's stack bounds with
+`sceKernelGetThreadInfo(0)`, rejects invalid sizes and overflowing ranges, and
+lets the existing GL argument validator enforce the requested byte count.
+It does not accept arbitrary addresses, reinterpret buffer offsets, or change
+the native TTBR or WAW branches. Pointers to another thread's stack are not
+newly accepted by this fallback.
+
+Apply it from the intended isolated flat-port source checkout, not from the
+Vita3K directory or an unrelated ongoing port worktree:
+
+```sh
+git apply --check /path/to/Vita3K/tools/waw/mach-o-vita-flat-gl-stack.patch
+git apply /path/to/Vita3K/tools/waw/mach-o-vita-flat-gl-stack.patch
+python3 /path/to/Vita3K/tools/waw/test-flat-gl-stack.py .
+```
+
+Do not reapply the patch when it is already present. Rebuild the flat BioShock
+executable with TTBR disabled and install only BIOS00001 in isolated emulator
+storage; never install this emulator-specific build on a physical Vita.
+
+All 106 source-extracted cases pass with ASan/UBSan across the flat/native
+BioShock and WAW compile-time configurations. They cover stack endpoints,
+truncated ranges, failed/empty/negative/overflowing stack descriptions, tracked
+heap/image pointers and buffer offsets. The pinned GCC 15.2.0 softfp build
+changed only the GL bridge object among 132 application objects. The tested
+EBOOT SHA-256 is
+`5d5a4f3f0f089c2a10e8ff3e70c36aed4b09d35ab35be379f73ee92e6b2a502f`.
+
+In the signed Vulkan emulator, the formerly rejected initial shader programs
+now link without the pointer/program warnings. The owner confirmed that both
+the loading-screen background and the opening gameplay scene render correctly.
+This verifies those observed scenes, not the full game, every rendering effect,
+long-session stability, or a particular frame rate. No commercial game assets,
+firmware or savedata are included in this companion patch.

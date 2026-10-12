@@ -1,0 +1,40 @@
+--- a/source/dynlib.c
++++ b/source/dynlib.c
+@@ -63,10 +63,11 @@
+ #include <wchar.h>
+ #include <sys/time.h>
+ #include <time.h>
+ #include <unistd.h>
+ #include <psp2/kernel/sysmem.h>
++#include <psp2/kernel/threadmgr.h>
+ #include <vitaGL.h>
+ #include <limits.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -800,10 +801,25 @@
+ static int ml_gl_native_stack_bytes_remaining(const void *ptr, size_t *remaining) {
+ #if ML_ENABLE_TTBR_REMAP_NATIVE_RUNNER && !ML_ENABLE_WAW_INTEGRATION
+     uintptr_t low=0,high=0,address=(uintptr_t)ptr;
+     if(ml_native_guest_stack_bounds(address,&low,&high) && address>=low && address<=high) {
+         *remaining=(size_t)(high-address);
++        return 1;
++    }
++#elif !ML_ENABLE_WAW_INTEGRATION
++    SceKernelThreadInfo info = {0};
++    info.size = sizeof(info);
++    if (sceKernelGetThreadInfo(0, &info) < 0 || !info.stack || info.stackSize <= 0)
++        return 0;
++    const uintptr_t low = (uintptr_t)info.stack;
++    const uintptr_t address = (uintptr_t)ptr;
++    const uintptr_t stack_size = (uintptr_t)info.stackSize;
++    if (stack_size > UINTPTR_MAX - low)
++        return 0;
++    const uintptr_t high = low + stack_size;
++    if (address >= low && address < high) {
++        *remaining = (size_t)(high - address);
+         return 1;
+     }
+ #else
+     (void)ptr;
+     (void)remaining;
