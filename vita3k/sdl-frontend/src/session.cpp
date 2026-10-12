@@ -25,6 +25,7 @@
 #include <audio/state.h>
 #include <config/state.h>
 #include <ctrl/functions.h>
+#include <ctrl/state.h>
 #include <emuenv/state.h>
 #include <ime/functions.h>
 #include <motion/event_handler.h>
@@ -52,6 +53,65 @@ void reset_session_audio(EmuEnvState &emuenv) {
     LOG_DEBUG("Resetting audio backend '{}' after SDL session shutdown", emuenv.audio.audio_backend);
     emuenv.audio.adapter.reset();
     emuenv.audio.audio_backend.clear();
+}
+
+void update_keyboard(EmuEnvState &emuenv, SDL_Window *window) {
+    VirtualKeyboardState keyboard{};
+    if (window && SDL_GetKeyboardFocus() == window && !is_any_ime_active(emuenv)) {
+        int key_count = 0;
+        const bool *keys = SDL_GetKeyboardState(&key_count);
+        const auto held = [&](input::PhysicalKeyCode key) {
+            const uint32_t usage = static_cast<uint32_t>(key);
+            const uint32_t scancode = usage & 0xffff;
+            // Only USB keyboard-page usages share SDL's numeric scancodes.
+            return keys && key_count > 0 && (usage >> 16) == 0x07
+                && scancode >= SDL_SCANCODE_A && scancode <= SDL_SCANCODE_RGUI
+                && scancode < static_cast<uint32_t>(key_count) && keys[scancode];
+        };
+        const auto pressed = [&](input::PhysicalKeyCode primary, input::PhysicalKeyCode alternate) {
+            return held(primary) || held(alternate);
+        };
+        const auto &cfg = emuenv.cfg;
+        const auto button = [&](input::PhysicalKeyCode primary, input::PhysicalKeyCode alternate,
+                                uint32_t normal, uint32_t extended) {
+            if (pressed(primary, alternate)) {
+                keyboard.buttons |= normal;
+                keyboard.buttons_ext |= extended;
+            }
+        };
+        button(cfg.keyboard_button_select, cfg.keyboard_button_select_alt, SCE_CTRL_SELECT, SCE_CTRL_SELECT);
+        button(cfg.keyboard_button_start, cfg.keyboard_button_start_alt, SCE_CTRL_START, SCE_CTRL_START);
+        button(cfg.keyboard_button_up, cfg.keyboard_button_up_alt, SCE_CTRL_UP, SCE_CTRL_UP);
+        button(cfg.keyboard_button_right, cfg.keyboard_button_right_alt, SCE_CTRL_RIGHT, SCE_CTRL_RIGHT);
+        button(cfg.keyboard_button_down, cfg.keyboard_button_down_alt, SCE_CTRL_DOWN, SCE_CTRL_DOWN);
+        button(cfg.keyboard_button_left, cfg.keyboard_button_left_alt, SCE_CTRL_LEFT, SCE_CTRL_LEFT);
+        button(cfg.keyboard_button_triangle, cfg.keyboard_button_triangle_alt, SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE);
+        button(cfg.keyboard_button_circle, cfg.keyboard_button_circle_alt, SCE_CTRL_CIRCLE, SCE_CTRL_CIRCLE);
+        button(cfg.keyboard_button_cross, cfg.keyboard_button_cross_alt, SCE_CTRL_CROSS, SCE_CTRL_CROSS);
+        button(cfg.keyboard_button_square, cfg.keyboard_button_square_alt, SCE_CTRL_SQUARE, SCE_CTRL_SQUARE);
+        button(cfg.keyboard_button_psbutton, cfg.keyboard_button_psbutton_alt, SCE_CTRL_PSBUTTON, SCE_CTRL_PSBUTTON);
+        button(cfg.keyboard_button_l1, cfg.keyboard_button_l1_alt, SCE_CTRL_L, SCE_CTRL_L1);
+        button(cfg.keyboard_button_r1, cfg.keyboard_button_r1_alt, SCE_CTRL_R, SCE_CTRL_R1);
+        button(cfg.keyboard_button_l2, cfg.keyboard_button_l2_alt, 0, SCE_CTRL_L2);
+        button(cfg.keyboard_button_r2, cfg.keyboard_button_r2_alt, 0, SCE_CTRL_R2);
+        button(cfg.keyboard_button_l3, cfg.keyboard_button_l3_alt, 0, SCE_CTRL_L3);
+        button(cfg.keyboard_button_r3, cfg.keyboard_button_r3_alt, 0, SCE_CTRL_R3);
+        keyboard.axes[0] = static_cast<float>(
+            static_cast<int>(pressed(cfg.keyboard_leftstick_right, cfg.keyboard_leftstick_right_alt))
+            - static_cast<int>(pressed(cfg.keyboard_leftstick_left, cfg.keyboard_leftstick_left_alt)));
+        keyboard.axes[1] = static_cast<float>(
+            static_cast<int>(pressed(cfg.keyboard_leftstick_down, cfg.keyboard_leftstick_down_alt))
+            - static_cast<int>(pressed(cfg.keyboard_leftstick_up, cfg.keyboard_leftstick_up_alt)));
+        keyboard.axes[2] = static_cast<float>(
+            static_cast<int>(pressed(cfg.keyboard_rightstick_right, cfg.keyboard_rightstick_right_alt))
+            - static_cast<int>(pressed(cfg.keyboard_rightstick_left, cfg.keyboard_rightstick_left_alt)));
+        keyboard.axes[3] = static_cast<float>(
+            static_cast<int>(pressed(cfg.keyboard_rightstick_down, cfg.keyboard_rightstick_down_alt))
+            - static_cast<int>(pressed(cfg.keyboard_rightstick_up, cfg.keyboard_rightstick_up_alt)));
+    }
+
+    std::lock_guard<std::mutex> lock(emuenv.ctrl.mutex);
+    emuenv.ctrl.keyboard_state = keyboard;
 }
 
 void notify_ime_changed(const Hooks &hooks) {
@@ -164,6 +224,7 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
         const auto cleanup_launch = [&](const app::AppSessionStopReason reason) {
             if (hooks.on_stop)
                 hooks.on_stop();
+            update_keyboard(emuenv, nullptr);
             session.stop(reason);
             reset_session_audio(emuenv);
 
@@ -290,7 +351,7 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
         app::LaunchRuntimeMetrics runtime_metrics{};
 
         const char *capture_setting = std::getenv("VITA3K_WAW_CAPTURE");
-        const bool capture_frames = launch_request.app_path == "WAW000001" &&
+        const bool capture_frames = (launch_request.app_path == "WAW000001" || launch_request.app_path == "BIOS00001") &&
             capture_setting && std::strcmp(capture_setting, "1") == 0;
         uint64_t next_capture_tick = SDL_GetTicks() + 5000;
         unsigned captured_frames = 0;
@@ -355,6 +416,8 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
                     break;
                 }
             }
+
+            update_keyboard(emuenv, window);
 
             if (!pending_launch_request) {
                 if (auto request = emuenv.take_app_launch_request()) {

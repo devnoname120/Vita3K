@@ -27,7 +27,7 @@ that WAW reaches its main screen; verify actual application output after each
 relevant emulator change.
 
 For a bounded startup observation, set `VITA3K_WAW_CAPTURE=1` when calling the
-launcher. On WAW only, the SDL frontend invokes the existing rendered-frame
+launcher. On WAW000001 and BIOS00001 only, the SDL frontend invokes the existing rendered-frame
 screenshot function every five seconds, at most 24 times. Images go to the
 isolated runtime's screenshots folder. This is optional observation overhead,
 not a performance measurement or synthetic main-screen image.
@@ -101,3 +101,64 @@ preferences synchronization. Null output is rejected and the complete output
 structure is cleared. The regression extracts and tests both exported routines.
 This remains a no-events stub, not implementation of real suspend/resume delivery.
 The change does not by itself establish a BioShock frame-rate improvement.
+
+
+## AvPlayer movie timing and looping
+
+Decoded audio and video timestamps are rescaled from each stream's time base
+into milliseconds. The decoder drains delayed frames and keeps the other
+stream's queued packets when one stream ends first. A looping source restarts
+only after both enabled decoder streams finish; queued sources keep priority.
+The data exports return false without replacing the caller's frame description
+when no new frame is ready. Audio/video polling and source/stop operations are
+serialized per player, without holding that lock across guest event callbacks.
+
+The BioShock menu movie uses a 90 kHz video time base at 24 FPS. Previously,
+its second frame's 3,750 timestamp ticks were reported as milliseconds, rather
+than approximately 42 ms, and the looping option had no effect. The corrected
+menu was confirmed working by the owner in the signed Vulkan emulator. This
+is not a gameplay compatibility result or a claim about the game's overall FPS.
+
+Run the focused decoder and HLE regressions after the emulator build:
+
+```sh
+python3 tools/waw/test-player.py
+python3 tools/waw/test-avplayer-data.py
+python3 tools/waw/test-capture-schedule.py
+```
+
+The first command generates a small H.264/AAC test movie with the local ffmpeg
+CLI and compiles the actual decoder sources against the emulator's FFmpeg
+libraries under AddressSanitizer and UndefinedBehaviorSanitizer. The HLE check
+also exercises concurrent audio/video consumers. No game movies are included.
+For a separately available 24 FPS source with a valid frame count, the resulting
+`build/waw-checks/player/test-player source <movie>` checks timestamps, full
+frame delivery and two loops. Generic streaming, seeking, stream disabling and
+all media-format combinations are not covered by these targeted regressions.
+
+## SDL keyboard controls
+
+The SDL frontend publishes its focused keyboard state to the same controller
+state used by the Qt frontend and guest controller APIs. Primary and alternate
+bindings are combined, opposing stick directions cancel, and normal/extended
+shoulder-button masks remain distinct. State is cleared during text entry,
+on focus loss, and at session shutdown. Physical USB keyboard-page bindings
+are supported; this does not add Qt-only hotkeys or consumer/media-key bindings.
+
+The previous SDL event loop handled key-down only for text-entry dialogs and
+never populated the virtual controller. Correct YAML mappings therefore had
+no effect on gameplay controls. BioShock menu navigation and activation were
+confirmed by the owner after the corrected signed build was relaunched.
+
+```sh
+python3 tools/waw/test-sdl-keyboard.py
+```
+
+The sanitizer-backed regression extracts the actual SDL event pump and
+controller reader, with the real configuration/controller types and controlled
+SDL keyboard state. It covers presses/releases, primary and alternate bindings,
+both sticks, focus changes, text-entry suppression and input-array bounds.
+
+BioShock gameplay is not yet validated: selecting New Game now works and the
+intro finishes, but a black screen is reported afterward. Loading/UI activity
+continues; its cause remains under investigation independently of menu controls.
