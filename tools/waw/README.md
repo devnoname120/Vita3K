@@ -76,6 +76,7 @@ python3 tools/waw/test-app-param-string.py
 python3 tools/waw/test-low-callbacks.py
 python3 tools/waw/test-pfs-adapter.py
 python3 tools/waw/test-portability.py
+python3 tools/waw/test-system-events.py
 ```
 
 These are local macOS checks against the actual source fragments. The low-address
@@ -89,3 +90,14 @@ The signing scripts intentionally target this local fork's fixed identity and
 bundle path. Firmware, the shader compiler, WAW assets and savedata are not part
 of this branch. Existing local submodule revisions were not rewritten by this
 work; use a compatible dependency checkout when reproducing the build.
+
+
+## Idle system-event polling
+
+Both public and internal app-manager event exports now return an empty event
+when no event queue is implemented. The previous stubs fabricated ON_RESUME
+on every poll, repeatedly invoking guest lifecycle callbacks and, in BioShock,
+preferences synchronization. Null output is rejected and the complete output
+structure is cleared. The regression extracts and tests both exported routines.
+This remains a no-events stub, not implementation of real suspend/resume delivery.
+The change does not by itself establish a BioShock frame-rate improvement.
