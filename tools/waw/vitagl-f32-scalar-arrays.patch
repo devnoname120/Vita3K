@@ -1,0 +1,30 @@
+--- a/source/utils/gxm_utils.c
++++ b/source/utils/gxm_utils.c
+@@ -71,7 +71,7 @@
+ 	if (offset != 0) {
+ 		switch (t) {
+ 			case SCE_GXM_PARAMETER_TYPE_F32:
+-				uniformBuffer += (componentCount < 3 ? 8 : 16) * offset;
++				uniformBuffer += (componentCount == 1 ? 4 : componentCount == 2 ? 8 : 16) * offset;
+ 				break;
+ 			case SCE_GXM_PARAMETER_TYPE_U32:
+ 			case SCE_GXM_PARAMETER_TYPE_S32:
+@@ -114,15 +114,15 @@
+ 		} else {
+ 			switch (t) {
+ 			case SCE_GXM_PARAMETER_TYPE_F32:
+-				if (componentCount == 2 || componentCount == 4) {
++				/* Scalar float arrays are packed; only float3 needs padding. */
++				if (componentCount != 3) {
+ 					vgl_fast_memcpy(uniformBuffer, sourceData, componentCount * 4 * count);
+ 				} else {
+-					uint32_t align_size = componentCount == 1 ? 8 : 16;
+ 					float *src = (float *)sourceData;
+ 					for (int i = 0; i < count; i++) {
+ 						vgl_fast_memcpy(uniformBuffer, src, componentCount * 4);
+ 						src += componentCount;
+-						uniformBuffer += align_size;
++						uniformBuffer += 16;
+ 					}
+ 				}
+ 				break;

@@ -231,3 +231,50 @@ artifacts and noisy ordinary textures were corrected. A separate green glow
 required the VitaGL uniform-packing correction documented with its companion
 patch; PVRTC decoding alone does not fix that tint. No frame-rate claim follows
 from these checks, and native compressed-image uploads are not implemented.
+
+
+## Companion VitaGL scalar float-array correction
+
+`vitagl-f32-scalar-arrays.patch` targets the VitaGL dependency used to build the
+port, not Vita3K. The F32-to-F32 uniform writer gave scalar array elements an
+8-byte stride instead of 4 bytes. The correction covers both array copies and
+nonzero element offsets, retaining 8-byte float2 and 16-byte float3/float4 strides.
+Only float3 requires padding between elements.
+
+In BioShock's diffuse fire-glow draw, three radius values belong at scalar words
+28, 29 and 30, while the following light color starts at word 32. The old writer
+used words 28, 30 and 32, overwriting the red component of that color. This was a
+uniform layout defect, not a texture recoloring or red/blue-swizzle issue.
+
+Apply the patch from the VitaGL source tree actually compiled into the port:
+
+```sh
+git apply --check /path/to/Vita3K/tools/waw/vitagl-f32-scalar-arrays.patch
+git apply /path/to/Vita3K/tools/waw/vitagl-f32-scalar-arrays.patch
+python3 /path/to/Vita3K/tools/waw/test-vitagl-f32-arrays.py \
+    source/utils/gxm_utils.c /path/to/new-test-results
+```
+
+Use a new output directory for each test run; existing results are preserved.
+Do not reapply the patch if it is already present. Rebuild VitaGL and relink the
+port against that library, including any port-specific dependency preparation.
+Updating Vita3K alone cannot correct uniform bytes written by the port.
+The emulator-specific flat BioShock executable must not be installed on a Vita.
+
+The source-extracted regression covers 1,457 F32-to-F32 cases under ASan/UBSan,
+including components 1 through 4, counts 0 through 12, offsets 0 through 6,
+4-byte-aligned bases, guard bytes and the observed adjacent-uniform layout.
+The original writer fails 333 cases; the patch passes all cases and produces
+source identical to the library used in the tested port build. Other uniform
+numeric-type conversions are outside this correction and these tests.
+
+Two completed 202-draw runtime captures retain the same glow texture, shaders,
+render-target settings, blend state and vertex layout. The first light's red
+component changes from approximately zero to 1.0, while green and blue remain
+approximately 0.659 and 0.318. The owner confirmed the corrected glow appearance;
+these are different animation frames, not a pixel-identical image comparison.
+The rebuilt port changes only VitaGL's gxm_utils.o; all 132 application objects
+remain identical. Its tested EBOOT SHA-256 is
+`0bb15734cf4670e67f6e269acf0db7dc926ea6ac9be2eac4cfd964eaeb04fdbb`.
+Temporary draw-probe code, captured game data and diagnostic launch settings are
+not included in this companion change.
