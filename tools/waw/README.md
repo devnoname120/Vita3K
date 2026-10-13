@@ -205,3 +205,29 @@ the loading-screen background and the opening gameplay scene render correctly.
 This verifies those observed scenes, not the full game, every rendering effect,
 long-session stability, or a particular frame rate. No commercial game assets,
 firmware or savedata are included in this companion patch.
+
+
+## PVRTC uploads on Vulkan
+
+The Vulkan format mapper stores all four GXM PVRTC variants in RGBA8 images.
+Advertising native PVRTC support must therefore not bypass decompression:
+otherwise compressed bytes are uploaded as RGBA8 pixels. This produced noisy
+ordinary textures and square-edged particles on a PVRTC-capable MoltenVK device.
+The Vulkan cache now selects the existing software decoder regardless of the
+GPU's PVRTC feature bit. Other texture formats and the common decoder are unchanged.
+
+```sh
+python3 tools/waw/test-pvrtc-upload.py
+```
+
+The source-extracted regression combines the Vulkan capability decision, format
+mapper, common upload branch and real PVRTC decoder. It tests 280 combinations
+under ASan/UBSan: four variants, GPU support on/off, RGB/alpha block patterns,
+seven dimensions and preservation of the compressed input. These patterns do
+not establish exhaustive correctness of the underlying PVRTC decoder.
+
+In BioShock's opening scene, the owner confirmed that the square particle
+artifacts and noisy ordinary textures were corrected. A separate green glow
+required the VitaGL uniform-packing correction documented with its companion
+patch; PVRTC decoding alone does not fix that tint. No frame-rate claim follows
+from these checks, and native compressed-image uploads are not implemented.
