@@ -79,3 +79,15 @@ endif()
 if(TRACY_ENABLE_ON_CORE_COMPONENTS)
 	target_link_libraries(renderer PRIVATE tracy)
 endif()
+
+if(NOT ANDROID)
+	find_package(Python3 QUIET COMPONENTS Interpreter)
+	if(Python3_Interpreter_FOUND)
+		add_test(
+			NAME renderer-mask-update-region-clip
+			COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/tests/mask_update_region_clip_test.py
+				${CMAKE_CURRENT_SOURCE_DIR}/src/state_set.cpp
+		)
+	endif()
+endif()
