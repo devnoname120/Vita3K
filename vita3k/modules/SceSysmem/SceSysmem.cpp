@@ -216,6 +216,15 @@ EXPORT(int, sceKernelGetMemBlockBase, SceUID uid, Ptr<void> *basep) {
     return CALL_EXPORT(ksceKernelGetMemBlockBase, uid, basep);
 }
 
+// The console reports a block's memory type and access with its type: memory
+// type is bits 8-15 of the block type (0xD0 cached, 0x80 uncached RAM) and
+// access bits 4-6 are X, W and R of the user mapping (0x60 = RW = 6).
+static void fill_memblock_type_details(SceKernelMemBlockInfo *info) {
+    const uint32_t type = static_cast<uint32_t>(info->type);
+    info->memoryType = static_cast<int>((type >> 8) & 0xFF);
+    info->access = ((type & 0x40) ? 4u : 0u) | ((type & 0x20) ? 2u : 0u) | ((type & 0x10) ? 1u : 0u);
+}
+
 EXPORT(int, sceKernelGetMemBlockInfoByAddr, Address addr, SceKernelMemBlockInfo *info) {
     TRACY_FUNC(sceKernelGetMemBlockInfoByAddr, addr, info);
     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
@@ -225,6 +234,7 @@ EXPORT(int, sceKernelGetMemBlockInfoByAddr, Address addr, SceKernelMemBlockInfo 
     for (const auto &[_, block_info] : state->blocks) {
         if (block_info->mappedBase.address() <= addr && (block_info->mappedBase.address() + block_info->mappedSize > addr)) {
             memcpy(info, block_info.get(), sizeof(SceKernelMemBlockInfo));
+            fill_memblock_type_details(info);
             return SCE_KERNEL_OK;
         }
     }
@@ -237,6 +247,7 @@ EXPORT(int, sceKernelGetMemBlockInfoByAddr, Address addr, SceKernelMemBlockInfo 
         info->mappedBase = Ptr<void>(base);
         info->mappedSize = size;
         info->type = SCE_KERNEL_MEMBLOCK_TYPE_USER_RW;
+        fill_memblock_type_details(info);
         return SCE_KERNEL_OK;
     }
 
