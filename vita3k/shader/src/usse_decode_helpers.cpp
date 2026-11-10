@@ -371,6 +371,7 @@ Operand &decode_dest(usse::Operand &dest, Imm6 dest_n, Imm2 dest_bank, bool bank
     dest.num = dest_n;
     dest.bank = decode_dest_bank(dest_bank, bank_ext);
     dest.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+    dest.is_double_regs = is_double_regs;
 
     if (is_double_regs)
         double_reg(dest.num, dest.bank);
@@ -383,6 +384,7 @@ Operand &decode_src12(usse::Operand &src, Imm6 src_n, Imm2 src_bank_sel, Imm1 sr
     src.bank = decode_src12_bank(src_bank_sel, src_bank_ext);
     src.num = src_n;
     src.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+    src.is_double_regs = is_double_regs;
 
     if (is_double_regs)
         double_reg(src.num, src.bank);
@@ -396,6 +398,7 @@ usse::Operand &decode_src0(usse::Operand &src, usse::Imm6 src_n, usse::Imm1 src_
     src.num = src_n;
     src.bank = decode_src0_bank(src_bank_sel, src_bank_ext);
     src.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+    src.is_double_regs = is_double_regs;
 
     if (is_double_regs)
         double_reg(src.num, src.bank);

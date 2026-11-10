@@ -41,10 +41,19 @@
 #endif
 
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string_view>
 
 namespace renderer::gl {
+static bool nova3_gl_probe_enabled() {
+    static const bool enabled = [] {
+        const char *title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+        return title && std::strcmp(title, "NOVA30001") == 0;
+    }();
+    return enabled;
+}
 
 GLContext::GLContext()
     : vertex_stream_ring_buffer(GL_ARRAY_BUFFER, MiB(128))
@@ -407,6 +416,32 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const 
     if (context.record.region_clip_mode != SCE_GXM_REGION_CLIP_NONE) {
         glEnable(GL_SCISSOR_TEST);
     }
+
+    static uint32_t nova3_context_count = 0;
+    if (nova3_gl_probe_enabled() && ++nova3_context_count <= 128) {
+        GLint framebuffer = 0;
+        GLint draw_buffer = 0;
+        GLint read_buffer = 0;
+        GLint viewport[4] = {};
+        GLint scissor[4] = {};
+        GLboolean color_mask[4] = {};
+        const GLenum prior_error = glGetError();
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+        glGetIntegerv(GL_DRAW_BUFFER, &draw_buffer);
+        glGetIntegerv(GL_READ_BUFFER, &read_buffer);
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glGetIntegerv(GL_SCISSOR_BOX, scissor);
+        glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        LOG_WARN("NOVA3_GL_CONTEXT index={} framebuffer={} status=0x{:X} attachment={} surface=0x{:08X} size={}x{} stride={} format=0x{:X} type=0x{:X} rt={}x{} msaa={} draw_buffer=0x{:X} read_buffer=0x{:X} viewport={},{},{},{} scissor_enabled={} scissor={},{},{},{} color_mask={},{},{},{} prior_error=0x{:X}",
+            nova3_context_count, framebuffer, status, context.current_color_attachment,
+            context.record.color_surface.data.address(), context.record.color_surface.width, context.record.color_surface.height, context.record.color_surface.strideInPixels,
+            static_cast<uint32_t>(context.record.color_surface.colorFormat), static_cast<uint32_t>(context.record.color_surface.surfaceType),
+            context.render_target->width, context.render_target->height, static_cast<uint32_t>(context.render_target->multisample_mode),
+            draw_buffer, read_buffer, viewport[0], viewport[1], viewport[2], viewport[3],
+            glIsEnabled(GL_SCISSOR_TEST), scissor[0], scissor[1], scissor[2], scissor[3],
+            color_mask[0], color_mask[1], color_mask[2], color_mask[3], prior_error);
+    }
 }
 
 static std::map<SceGxmColorFormat, std::pair<GLenum, GLenum>> GXM_COLOR_FORMAT_TO_GL_FORMAT = {
@@ -597,6 +632,19 @@ void get_surface_data(GLState &renderer, GLContext &context, uint32_t *pixels, S
         return;
     }
 
+    static uint32_t nova3_readback_count = 0;
+    const bool nova3_probe_readback = nova3_gl_probe_enabled() && ++nova3_readback_count <= 128;
+    GLint nova3_framebuffer = 0;
+    GLint nova3_read_buffer = 0;
+    GLenum nova3_framebuffer_status = 0;
+    GLenum nova3_prior_error = 0;
+    if (nova3_probe_readback) {
+        nova3_prior_error = glGetError();
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &nova3_framebuffer);
+        glGetIntegerv(GL_READ_BUFFER, &nova3_read_buffer);
+        nova3_framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    }
+
     SceGxmColorFormat format = surface.colorFormat;
     uint32_t width = surface.width;
     uint32_t height = surface.height;
@@ -635,7 +683,26 @@ void get_surface_data(GLState &renderer, GLContext &context, uint32_t *pixels, S
     } else {
         glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), format_gl->second.first, format_gl->second.second, temp_store);
     }
+    const GLenum nova3_read_error = nova3_probe_readback ? glGetError() : GL_NO_ERROR;
     post_process_pixels_data(renderer, pixels, temp_store, width, height, surface.strideInPixels, surface);
+
+    if (nova3_probe_readback) {
+        const size_t center_index = static_cast<size_t>(surface.height / 2) * surface.strideInPixels + surface.width / 2;
+        const size_t last_index = static_cast<size_t>(surface.height - 1) * surface.strideInPixels + surface.width - 1;
+        uint32_t nonblack = 0;
+        for (uint32_t y = 0; y < surface.height; y++) {
+            const uint32_t *row = pixels + static_cast<size_t>(y) * surface.strideInPixels;
+            for (uint32_t x = 0; x < surface.width; x++) {
+                if ((row[x] & 0x00FFFFFFu) != 0) {
+                    nonblack++;
+                }
+            }
+        }
+        LOG_WARN("NOVA3_GL_READBACK index={} framebuffer={} status=0x{:X} attachment={} read_buffer=0x{:X} surface=0x{:08X} size={}x{} stride={} format=0x{:X} prior_error=0x{:X} read_error=0x{:X} first=0x{:08X} center=0x{:08X} last=0x{:08X} nonblack={}",
+            nova3_readback_count, nova3_framebuffer, nova3_framebuffer_status, context.current_color_attachment, nova3_read_buffer,
+            surface.data.address(), surface.width, surface.height, surface.strideInPixels, static_cast<uint32_t>(surface.colorFormat),
+            nova3_prior_error, nova3_read_error, pixels[0], pixels[center_index], pixels[last_index], nonblack);
+    }
 
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 }

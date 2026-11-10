@@ -31,8 +31,9 @@
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
+
+typedef struct SDL_Thread SDL_Thread;
 
 struct DialogState;
 struct DisplayState;
@@ -123,7 +124,7 @@ struct State {
     std::atomic<bool> async_flip_requested{ false };
     std::atomic<int> pending_vsync{ -1 };
 
-    std::unique_ptr<std::thread> render_thread;
+    SDL_Thread *render_thread = nullptr;
     std::atomic<bool> render_abort{ false };
 
     std::vector<ShadersHash> precompile_queue;

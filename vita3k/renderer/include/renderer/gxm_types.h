@@ -198,6 +198,8 @@ struct GxmContextState {
     SceIVector2 region_clip_min;
     SceIVector2 region_clip_max;
     GxmViewport viewport;
+    SceGxmWClampMode w_clamp_mode = SCE_GXM_WCLAMP_MODE_ENABLED;
+    float w_clamp_value = 0.00001f;
 
     // Triangle setup?
     SceGxmCullMode cull_mode = SCE_GXM_CULL_NONE;

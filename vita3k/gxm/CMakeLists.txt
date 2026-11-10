@@ -7,11 +7,12 @@ add_library(
 	src/attributes.cpp
 	src/color.cpp
 	src/gxp.cpp
+	src/state.cpp
 	src/stream.cpp
 	src/textures.cpp
 	src/transfer.cpp
 )
 
 target_include_directories(gxm PUBLIC include)
-target_link_libraries(gxm PUBLIC util)
-target_link_libraries(gxm PRIVATE)
+target_link_libraries(gxm PUBLIC util threads)
+target_link_libraries(gxm PRIVATE SDL3::SDL3)

@@ -33,7 +33,18 @@
 
 #include <spdlog/fmt/bin_to_hex.h>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace renderer::gl {
+static bool nova3_gl_probe_enabled() {
+    static const bool enabled = [] {
+        const char *title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+        return title && std::strcmp(title, "NOVA30001") == 0;
+    }();
+    return enabled;
+}
+
 static GLenum translate_primitive(SceGxmPrimitiveType primType) {
     R_PROFILE(__func__);
 
@@ -123,6 +134,15 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
     shader::RenderVertUniformBlock &vert_ublock = context.current_vert_render_info;
     vert_ublock.viewport_flip = context.record.viewport_flip;
     vert_ublock.viewport_flag = (context.record.viewport_flat) ? 0.0f : 1.0f;
+    const char *const gl_clip_compat_env = std::getenv("VITA3K_ACXI_GL_CLIP_COMPAT");
+    const char *const force_clip_reject_env = std::getenv("VITA3K_ACXI_FORCE_CLIP_REJECT");
+    const bool gl_clip_compat = config.run_app_path && *config.run_app_path == "ACXI00001"
+        && gl_clip_compat_env && gl_clip_compat_env[0] == '1' && gl_clip_compat_env[1] == 0;
+    const bool force_clip_reject = config.run_app_path && *config.run_app_path == "ACXI00001"
+        && force_clip_reject_env && force_clip_reject_env[0] == '1' && force_clip_reject_env[1] == 0;
+    vert_ublock.w_clamp_enabled = gl_clip_compat ? 0.0f : context.record.w_clamp_enabled ? 1.0f : 0.0f;
+    vert_ublock.w_clamp_value = context.record.w_clamp_value;
+    vert_ublock.post_viewport_clip = force_clip_reject ? 2.0f : gl_clip_compat ? 1.0f : 0.0f;
     vert_ublock.z_offset = context.record.z_offset;
     vert_ublock.z_scale = context.record.z_scale;
     vert_ublock.screen_width = static_cast<float>(context.record.color_surface.width);
@@ -220,10 +240,96 @@ void draw(GLState &renderer, GLContext &context, const FeatureState &features, S
     const GLenum mode = translate_primitive(type);
     const GLenum gl_type = format == SCE_GXM_INDEX_FORMAT_U16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
 
+    static uint32_t nova3_probe_draw_count = 0;
+    const bool nova3_probe_draw = nova3_gl_probe_enabled()
+        && type == SCE_GXM_PRIMITIVE_TRIANGLE_FAN
+        && count == 4
+        && ++nova3_probe_draw_count <= 128;
+    GLint probe_framebuffer = 0;
+    GLenum probe_framebuffer_status = 0;
+    if (nova3_probe_draw) {
+        const GLenum prior_error = glGetError();
+        GLint probe_program = 0;
+        GLint probe_viewport[4] = {};
+        GLint probe_scissor[4] = {};
+        GLint probe_draw_buffer = 0;
+        GLint probe_read_buffer = 0;
+        GLint probe_sample_buffers = 0;
+        GLint probe_samples = 0;
+        GLboolean probe_color_mask[4] = {};
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &probe_framebuffer);
+        glGetIntegerv(GL_CURRENT_PROGRAM, &probe_program);
+        glGetIntegerv(GL_VIEWPORT, probe_viewport);
+        glGetIntegerv(GL_SCISSOR_BOX, probe_scissor);
+        glGetIntegerv(GL_DRAW_BUFFER, &probe_draw_buffer);
+        glGetIntegerv(GL_READ_BUFFER, &probe_read_buffer);
+        glGetIntegerv(GL_SAMPLE_BUFFERS, &probe_sample_buffers);
+        glGetIntegerv(GL_SAMPLES, &probe_samples);
+        glGetBooleanv(GL_COLOR_WRITEMASK, probe_color_mask);
+        probe_framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        uint32_t index0 = 0;
+        uint32_t index1 = 0;
+        uint32_t index2 = 0;
+        uint32_t index3 = 0;
+        if (format == SCE_GXM_INDEX_FORMAT_U16) {
+            const auto *data = static_cast<const uint16_t *>(indices);
+            index0 = data[0];
+            index1 = data[1];
+            index2 = data[2];
+            index3 = data[3];
+        } else {
+            const auto *data = static_cast<const uint32_t *>(indices);
+            index0 = data[0];
+            index1 = data[1];
+            index2 = data[2];
+            index3 = data[3];
+        }
+        const auto *fragment = reinterpret_cast<const GLFragmentProgram *>(gxm_fragment_program.renderer_data.get());
+        LOG_WARN("NOVA3_GL_DRAW_BEFORE index={} framebuffer={} status=0x{:X} attachment={} program={} mode=0x{:X} gl_type=0x{:X} indices={},{},{},{} viewport={},{},{},{} scissor_enabled={} scissor={},{},{},{} color_mask={},{},{},{} draw_buffer=0x{:X} read_buffer=0x{:X} sample_buffers={} samples={} blend={} depth={} stencil={} cull={} prior_error=0x{:X} surface=0x{:08X} size={}x{} stride={} rt={}x{} msaa={} front_enable={} back_enable={} two_sided={} region_mode={} region={},{},{},{} fragment_mask={},{},{},{} native_color={} frag_color_used={}",
+            nova3_probe_draw_count, probe_framebuffer, probe_framebuffer_status, context.current_color_attachment, probe_program, mode, gl_type,
+            index0, index1, index2, index3,
+            probe_viewport[0], probe_viewport[1], probe_viewport[2], probe_viewport[3],
+            glIsEnabled(GL_SCISSOR_TEST), probe_scissor[0], probe_scissor[1], probe_scissor[2], probe_scissor[3],
+            probe_color_mask[0], probe_color_mask[1], probe_color_mask[2], probe_color_mask[3],
+            probe_draw_buffer, probe_read_buffer, probe_sample_buffers, probe_samples,
+            glIsEnabled(GL_BLEND), glIsEnabled(GL_DEPTH_TEST), glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_CULL_FACE), prior_error,
+            context.record.color_surface.data.address(), context.record.color_surface.width, context.record.color_surface.height, context.record.color_surface.strideInPixels,
+            context.render_target->width, context.render_target->height, static_cast<uint32_t>(context.render_target->multisample_mode),
+            static_cast<uint32_t>(context.record.front_side_fragment_program_mode), static_cast<uint32_t>(context.record.back_side_fragment_program_mode),
+            static_cast<uint32_t>(context.record.two_sided), static_cast<uint32_t>(context.record.region_clip_mode),
+            context.record.region_clip_min.x, context.record.region_clip_min.y, context.record.region_clip_max.x, context.record.region_clip_max.y,
+            fragment->color_mask_red, fragment->color_mask_green, fragment->color_mask_blue, fragment->color_mask_alpha,
+            fragment_program_gxp.is_native_color(), fragment_program_gxp.is_frag_color_used());
+    }
+
     if (instance_count == 1) {
         glDrawElements(mode, static_cast<GLsizei>(count), gl_type, reinterpret_cast<const void *>(index_gpu_ptr.second));
     } else {
         glDrawElementsInstanced(mode, static_cast<GLsizei>(count), gl_type, reinterpret_cast<const void *>(index_gpu_ptr.second), instance_count);
+    }
+
+    if (nova3_probe_draw) {
+        const GLenum draw_error = glGetError();
+        GLint pack_buffer = 0;
+        GLint pack_row_length = 0;
+        GLint pack_alignment = 0;
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+        glGetIntegerv(GL_PACK_ROW_LENGTH, &pack_row_length);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
+        uint32_t pixel = 0;
+        GLenum read_error = 0;
+        if (pack_buffer == 0 && probe_framebuffer_status == GL_FRAMEBUFFER_COMPLETE) {
+            glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            glReadPixels(static_cast<GLint>(context.record.color_surface.width / 2),
+                static_cast<GLint>(context.record.color_surface.height / 2),
+                1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel);
+            read_error = glGetError();
+            glPixelStorei(GL_PACK_ROW_LENGTH, pack_row_length);
+            glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
+        }
+        LOG_WARN("NOVA3_GL_DRAW_AFTER index={} framebuffer={} draw_error=0x{:X} read_error=0x{:X} pack_buffer={} center=0x{:08X}",
+            nova3_probe_draw_count, probe_framebuffer, draw_error, read_error, pack_buffer, pixel);
     }
 
     // Restore context for normal draws

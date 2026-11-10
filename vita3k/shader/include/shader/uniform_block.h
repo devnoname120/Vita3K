@@ -12,6 +12,9 @@ namespace shader {
 struct RenderVertUniformBlock {
     std::array<float, 4> viewport_flip;
     float viewport_flag;
+    float w_clamp_enabled;
+    float w_clamp_value;
+    float post_viewport_clip;
     float screen_width;
     float screen_height;
     float z_offset;
@@ -23,6 +26,9 @@ struct RenderVertUniformBlock {
 enum VertUniformFieldId : uint32_t {
     VERT_UNIFORM_viewport_flip,
     VERT_UNIFORM_viewport_flag,
+    VERT_UNIFORM_w_clamp_enabled,
+    VERT_UNIFORM_w_clamp_value,
+    VERT_UNIFORM_post_viewport_clip,
     VERT_UNIFORM_screen_width,
     VERT_UNIFORM_screen_height,
     VERT_UNIFORM_z_offset,

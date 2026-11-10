@@ -30,8 +30,11 @@
 #include <overlay/shader_precompile_progress.h>
 #include <util/log.h>
 
+#include <SDL3/SDL_thread.h>
+
+#include <cstdlib>
+#include <cstring>
 #include <memory>
-#include <thread>
 
 #ifdef TRACY_ENABLE
 #include <tracy/Tracy.hpp>
@@ -283,17 +286,68 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
     state.done_current();
 }
 
+struct RenderThreadArguments {
+    State *state;
+    DisplayState *display;
+    GxmState *gxm;
+    MemState *mem;
+    Config *config;
+};
+
+static int SDLCALL render_thread_entry(void *data) {
+    std::unique_ptr<RenderThreadArguments> arguments(
+        static_cast<RenderThreadArguments *>(data));
+    render_loop(*arguments->state, *arguments->display, *arguments->gxm,
+        *arguments->mem, *arguments->config);
+    return 0;
+}
+
+static SDL_Thread *create_render_thread(State &state, DisplayState &display,
+    GxmState &gxm, MemState &mem, Config &config) {
+    auto *arguments = new RenderThreadArguments{
+        &state, &display, &gxm, &mem, &config
+    };
+    SDL_Thread *thread = nullptr;
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    const char *ttbr_hle_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    if (ttbr_hle_title && *ttbr_hle_title) {
+        const SDL_PropertiesID properties = SDL_CreateProperties();
+        if (properties) {
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,
+                reinterpret_cast<void *>(&render_thread_entry));
+            SDL_SetStringProperty(properties, SDL_PROP_THREAD_CREATE_NAME_STRING,
+                "Vita3K Renderer");
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_USERDATA_POINTER,
+                arguments);
+            const Sint64 stack_size = std::strcmp(ttbr_hle_title, "ASPHALT07") == 0
+                ? 32 * 1024 * 1024
+                : 8 * 1024 * 1024;
+            SDL_SetNumberProperty(properties, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER,
+                stack_size);
+            thread = SDL_CreateThreadWithProperties(properties);
+            SDL_DestroyProperties(properties);
+        }
+    }
+#endif
+    if (!thread)
+        thread = SDL_CreateThread(&render_thread_entry, "Vita3K Renderer", arguments);
+    if (!thread)
+        delete arguments;
+    return thread;
+}
+
 void start_render_thread(State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
     state.render_abort = false;
-    state.render_thread = std::make_unique<std::thread>(render_loop, std::ref(state), std::ref(display), std::ref(gxm), std::ref(mem), std::ref(config));
+    state.render_thread = create_render_thread(state, display, gxm, mem, config);
+    LOG_CRITICAL_IF(!state.render_thread, "Failed to create renderer thread");
 }
 
 void stop_render_thread(State &state) {
     state.render_abort = true;
     state.command_buffer_queue.abort();
-    if (state.render_thread && state.render_thread->joinable())
-        state.render_thread->join();
-    state.render_thread.reset();
+    if (state.render_thread)
+        SDL_WaitThread(state.render_thread, nullptr);
+    state.render_thread = nullptr;
     state.command_buffer_queue.reset();
 }
 

@@ -182,13 +182,13 @@ void set_texture(State &state, Context *ctx, const std::uint32_t tex_index, cons
     renderer::add_state_set_command(ctx, renderer::GXMState::Texture, tex_index, tex);
 }
 
-void set_viewport_real(State &state, Context *ctx, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale) {
-    renderer::add_state_set_command(ctx, renderer::GXMState::Viewport, false, xOffset, yOffset,
-        zOffset, xScale, yScale, zScale);
+void set_viewport_real(State &state, Context *ctx, bool wClampEnabled, float wClampValue, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale) {
+    renderer::add_state_set_command(ctx, renderer::GXMState::Viewport, false, wClampEnabled, wClampValue,
+        xOffset, yOffset, zOffset, xScale, yScale, zScale);
 }
 
-void set_viewport_flat(State &state, Context *ctx) {
-    renderer::add_state_set_command(ctx, renderer::GXMState::Viewport, true);
+void set_viewport_flat(State &state, Context *ctx, bool wClampEnabled, float wClampValue) {
+    renderer::add_state_set_command(ctx, renderer::GXMState::Viewport, true, wClampEnabled, wClampValue);
 }
 
 void set_region_clip(State &state, Context *ctx, SceGxmRegionClipMode mode, unsigned int xMin, unsigned int xMax, unsigned int yMin, unsigned int yMax) {

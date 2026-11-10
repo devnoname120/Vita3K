@@ -23,9 +23,10 @@
 
 #include <map>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+typedef struct SDL_Thread SDL_Thread;
 
 struct EmuEnvState;
 struct SceGxmContext;
@@ -59,7 +60,7 @@ struct GxmState {
 
     Queue<DisplayCallback> display_queue;
     SceUID display_queue_thread;
-    std::thread display_host_thread;
+    SDL_Thread *display_host_thread = nullptr;
 
     // global timestamp used by sync objects
     std::atomic<uint32_t> global_timestamp{ 1 };
@@ -78,25 +79,5 @@ struct GxmState {
     std::unordered_map<SceGxmContext *, Address> deferred_contexts;
     std::unordered_map<SceGxmRenderTarget *, Address> render_targets;
 
-    void deinit() {
-        if (display_host_thread.joinable())
-            display_host_thread.join();
-
-        {
-            const std::lock_guard<std::mutex> lock(sync_objects_mutex);
-            sync_objects.clear();
-        }
-
-        memory_mapped_regions.clear();
-        display_queue.reset();
-        params = {};
-        display_queue_thread = 0;
-        global_timestamp = 1;
-        last_display_global = 0;
-        notification_region = Ptr<uint32_t>(0);
-        immediate_contexts.clear();
-        last_immediate_context = 0;
-        deferred_contexts.clear();
-        render_targets.clear();
-    }
+    void deinit();
 };

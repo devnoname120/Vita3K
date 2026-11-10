@@ -630,6 +630,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             .fragmentStoresAndAtomics = physical_device_features.fragmentStoresAndAtomics,
             .shaderStorageImageExtendedFormats = physical_device_features.shaderStorageImageExtendedFormats,
             .shaderInt16 = physical_device_features.shaderInt16,
+            .shaderClipDistance = physical_device_features.shaderClipDistance,
         };
 
         // look for optional extensions

@@ -315,11 +315,13 @@ struct Operand {
     RegisterFlags flags{};
     Swizzle4 swizzle = SWIZZLE_CHANNEL_4_UNDEFINED;
     DataType type = DataType::F32;
+    bool is_double_regs{ false };
 
     int index{ 0 };
 
     bool is_same(const Operand &op, const Imm4 mask) {
-        return (op.bank == bank) && (is_identical(swizzle, op.swizzle, mask)) && (num == op.num);
+        return (op.bank == bank) && (is_identical(swizzle, op.swizzle, mask)) && (num == op.num)
+            && (is_double_regs == op.is_double_regs);
     }
 };
 
@@ -391,8 +393,7 @@ struct AttributeInputSource {
 };
 
 struct LiteralInputSource {
-    // The constant data
-    float data;
+    std::uint32_t data_bits;
 };
 
 struct UniformBufferInputSource {

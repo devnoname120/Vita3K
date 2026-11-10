@@ -29,6 +29,10 @@
 #include <util/log.h>
 #include <util/vector_utils.h>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 extern "C" {
 #include <libswscale/swscale.h>
 }
@@ -58,6 +62,27 @@ static bool format_need_additional_memory(SceGxmColorBaseFormat format) {
 }
 
 namespace renderer::vulkan {
+
+static bool surface_present_trace_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("VITA3K_SURFACE_PRESENT_TRACE");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    if (!enabled)
+        return false;
+    const char *const request_path = std::getenv("VITA3K_SURFACE_PRESENT_TRACE_REQUEST");
+    if (!request_path || !*request_path)
+        return true;
+    FILE *const request = std::fopen(request_path, "rb");
+    if (!request)
+        return false;
+    std::fclose(request);
+    return true;
+}
+
+static std::atomic<uint32_t> surface_present_write_logs{ 0 };
+static std::atomic<uint32_t> surface_present_lookup_logs{ 0 };
+static std::atomic<uint32_t> surface_texture_lookup_logs{ 0 };
 
 static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
     const bool trap_reads = (info.tiling == SurfaceTiling::Linear
@@ -247,6 +272,18 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
     uint32_t bytes_per_stride = color->strideInPixels * gxm::bits_per_pixel(base_format) / 8;
     uint32_t total_surface_size = bytes_per_stride * original_height;
 
+    if (surface_present_trace_enabled()) {
+        const uint32_t log_index = surface_present_write_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 96) {
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_CACHE_WRITE call=%u address=0x%08X size=%ux%u stride=%u bytes=%u type=%u format=0x%08X cache=%zu mapping=%u protect=%u\n",
+                log_index + 1, address, original_width, original_height, bytes_per_stride,
+                total_surface_size, static_cast<uint32_t>(color->surfaceType),
+                static_cast<uint32_t>(color->colorFormat), color_address_lookup.size(),
+                state.features.enable_memory_mapping, can_mprotect_mapped_memory);
+        }
+    }
+
     VKContext *context = reinterpret_cast<VKContext *>(state.context);
 
     if (overlap) {
@@ -385,11 +422,23 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
 }
 
 std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport) {
-    // Create the key to access the cache struct
     const uint32_t address = (texture.data_addr << 2);
-
     const uint32_t original_width = gxm::get_width(texture);
     const uint32_t original_height = gxm::get_height(texture);
+    const bool trace = surface_present_trace_enabled();
+    const uint32_t log_index = trace
+        ? surface_texture_lookup_logs.fetch_add(1, std::memory_order_relaxed)
+        : 0;
+    const bool log = trace && log_index < 256;
+    if (log) {
+        std::fprintf(stderr,
+            "VITA3K_SURFACE_TEXTURE_LOOKUP call=%u address=0x%08X size=%ux%u type=%u format=0x%08X base=%u cache=%zu mapping=%u protect=%u\n",
+            log_index + 1, address, original_width, original_height,
+            static_cast<uint32_t>(texture.texture_type()),
+            static_cast<uint32_t>(gxm::get_format(texture)),
+            static_cast<uint32_t>(base_format), color_address_lookup.size(),
+            state.features.enable_memory_mapping, can_mprotect_mapped_memory);
+    }
 
     const uint32_t width = static_cast<uint32_t>(original_width * state.res_multiplier);
     const uint32_t height = static_cast<uint32_t>(original_height * state.res_multiplier);
@@ -406,12 +455,29 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
 
     overlap = (overlap && (ite->first + ite->second->total_bytes) > address);
 
-    if (!overlap)
+    if (!overlap) {
+        if (log)
+            std::fprintf(stderr, "VITA3K_SURFACE_TEXTURE_MISS call=%u reason=no_overlap\n", log_index + 1);
         return std::nullopt;
+    }
 
-    if (*ite->second->dirty)
-        // Guest wrote to the surface backing memory since it was rendered, so GPU data is stale.
+    ColorSurfaceCacheInfo &info = *ite->second;
+    if (log) {
+        std::fprintf(stderr,
+            "VITA3K_SURFACE_TEXTURE_CANDIDATE call=%u key=0x%08X data=0x%08X total=%u stride=%u size=%ux%u original=%ux%u format=%u tiling=%u last_frame=%llu dirty=%u\n",
+            log_index + 1, ite->first, info.data.address(), info.total_bytes,
+            info.stride_bytes, info.width, info.height, info.original_width,
+            info.original_height, static_cast<uint32_t>(info.format),
+            static_cast<uint32_t>(info.tiling),
+            static_cast<unsigned long long>(info.last_frame_rendered),
+            info.dirty ? *info.dirty : false);
+    }
+
+    if (*info.dirty) {
+        if (log)
+            std::fprintf(stderr, "VITA3K_SURFACE_TEXTURE_MISS call=%u reason=dirty\n", log_index + 1);
         return std::nullopt;
+    }
 
     const vk::ComponentMapping swizzle = texture::translate_swizzle(gxm::get_format(texture));
     vk::Format vk_format = color::translate_format(base_format);
@@ -452,32 +518,53 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         stride_bytes = pixel_stride * gxm::bits_per_pixel(base_format) / 8;
     }
     uint32_t total_surface_size = stride_bytes * original_height;
-
-    ColorSurfaceCacheInfo &info = *ite->second;
+    if (log) {
+        std::fprintf(stderr,
+            "VITA3K_SURFACE_TEXTURE_LAYOUT call=%u stride=%u total=%u tiling=%u width=%u height=%u vk=%u\n",
+            log_index + 1, stride_bytes, total_surface_size,
+            static_cast<uint32_t>(tiling), width, height,
+            static_cast<uint32_t>(vk_format));
+    }
 
     if ((base_format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8 || info.format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8)
-        && base_format != info.format)
-        // don't even try to match u8u8u8 with something else
+        && base_format != info.format) {
+        if (log)
+            std::fprintf(stderr, "VITA3K_SURFACE_TEXTURE_MISS call=%u reason=u8u8u8_format candidate=%u request=%u\n",
+                log_index + 1, static_cast<uint32_t>(info.format), static_cast<uint32_t>(base_format));
         return std::nullopt;
+    }
 
-    if (tiling != info.tiling || info.stride_bytes != stride_bytes)
-        // if the tiling is different, also don't try to match them
-        // about the strides, I've yet to see a case where the byte stride is different
+    if (tiling != info.tiling || info.stride_bytes != stride_bytes) {
+        if (log)
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_TEXTURE_MISS call=%u reason=layout candidate_tiling=%u request_tiling=%u candidate_stride=%u request_stride=%u\n",
+                log_index + 1, static_cast<uint32_t>(info.tiling), static_cast<uint32_t>(tiling),
+                info.stride_bytes, stride_bytes);
         return std::nullopt;
+    }
 
     // Check if we can use this surface
     bool addr_in_range_of_cache = ((address + total_surface_size) <= (ite->first + info.total_bytes + 4));
 
-    if (ite->first != address && !addr_in_range_of_cache)
-        // persona 4 sample from the top of a texture while the bottom wasn't rendered to, the fact that both the surface and
-        // the texture start at the same location should be enough
+    if (ite->first != address && !addr_in_range_of_cache) {
+        if (log)
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_TEXTURE_MISS call=%u reason=range request_end=0x%08X candidate_end=0x%08X\n",
+                log_index + 1, address + total_surface_size,
+                ite->first + info.total_bytes + 4);
         return std::nullopt;
+    }
 
     uint32_t bytes_per_pixel_requested = gxm::bits_per_pixel(base_format) / 8;
     uint32_t bytes_per_pixel_in_store = gxm::bits_per_pixel(info.format) / 8;
 
-    if (std::max(bytes_per_pixel_requested, bytes_per_pixel_in_store) % std::min(bytes_per_pixel_requested, bytes_per_pixel_in_store) != 0)
+    if (std::max(bytes_per_pixel_requested, bytes_per_pixel_in_store) % std::min(bytes_per_pixel_requested, bytes_per_pixel_in_store) != 0) {
+        if (log)
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_TEXTURE_MISS call=%u reason=bpp candidate=%u request=%u\n",
+                log_index + 1, bytes_per_pixel_in_store, bytes_per_pixel_requested);
         return std::nullopt;
+    }
 
     // TODO: this is true only for linear textures (and also kind of for tiled textures) (and in this case start_x = 0),
     // for swizzled textures this is different
@@ -504,12 +591,18 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         };
 
         // if everything matches
-        if (vk_format == info.texture.format && swizzle == info.swizzle)
+        if (vk_format == info.texture.format && swizzle == info.swizzle) {
+            if (log)
+                std::fprintf(stderr,
+                    "VITA3K_SURFACE_TEXTURE_HIT call=%u path=viewport-primary ratio=%f,%f offset=%f,%f\n",
+                    log_index + 1, texture_viewport->ratio.first, texture_viewport->ratio.second,
+                    texture_viewport->offset.first, texture_viewport->offset.second);
             return TextureLookupResult{
                 info.texture.view,
                 info.texture.layout,
                 info.texture.format
             };
+        }
 
         // use the other view with the correct swizzle / gamma correction
         if (!info.alternate_view) {
@@ -525,6 +618,11 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
             info.alternate_view = state.device.createImageView(view_info);
         }
 
+        if (log)
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_TEXTURE_HIT call=%u path=viewport-alternate ratio=%f,%f offset=%f,%f\n",
+                log_index + 1, texture_viewport->ratio.first, texture_viewport->ratio.second,
+                texture_viewport->offset.first, texture_viewport->offset.second);
         return TextureLookupResult{
             info.alternate_view,
             info.texture.layout,
@@ -545,7 +643,10 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
                 casted = &casted_vec[i];
 
                 if (casted->scene_timestamp == scene_timestamp) {
-                    // already copied for this scene, don't do it again
+                    if (log)
+                        std::fprintf(stderr,
+                            "VITA3K_SURFACE_TEXTURE_HIT call=%u path=cast-cache crop=%u,%u %ux%u\n",
+                            log_index + 1, start_x, start_sourced_line, width, height);
                     return TextureLookupResult{
                         casted->texture.view,
                         casted->texture.layout,
@@ -648,6 +749,12 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         }
         casted->texture.transition_to(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
 
+        if (log)
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_TEXTURE_HIT call=%u path=cast-copy crop=%u,%u %ux%u same_image=%u candidate=%ux%u request=%ux%u candidate_format=%u request_format=%u\n",
+                log_index + 1, start_x, start_sourced_line, width, height,
+                is_same_image, info.width, info.height, width, height,
+                static_cast<uint32_t>(info.format), static_cast<uint32_t>(base_format));
         return TextureLookupResult{
             casted->texture.view,
             casted->texture.layout,
@@ -655,13 +762,15 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
         };
     } else {
         // the renderpass external dependencies should take care of the barrier
-        if (swizzle == info.swizzle && vk_format == info.texture.format)
-            // we can use the same texture view
+        if (swizzle == info.swizzle && vk_format == info.texture.format) {
+            if (log)
+                std::fprintf(stderr, "VITA3K_SURFACE_TEXTURE_HIT call=%u path=direct-primary\n", log_index + 1);
             return TextureLookupResult{
                 info.texture.view,
                 info.texture.layout,
                 info.texture.format
             };
+        }
 
         if (!info.alternate_view) {
             vk::ComponentMapping resulting_mapping = vkutil::color_to_texture_swizzle(info.swizzle, swizzle);
@@ -676,6 +785,8 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
             info.alternate_view = state.device.createImageView(view_info);
         }
 
+        if (log)
+            std::fprintf(stderr, "VITA3K_SURFACE_TEXTURE_HIT call=%u path=direct-alternate\n", log_index + 1);
         return TextureLookupResult{
             info.alternate_view,
             vkutil::ImageLayout::ColorAttachmentReadWrite,
@@ -1393,63 +1504,119 @@ void VKSurfaceCache::destroy_associated_framebuffers(const VKRenderTarget *rende
 }
 
 vk::ImageView VKSurfaceCache::sourcing_color_surface_for_presentation(Ptr<const void> address, uint32_t pitch, Viewport &viewport) {
-    // get closest surface with an address below address
+    const bool trace = surface_present_trace_enabled();
+    const uint32_t log_index = trace
+        ? surface_present_lookup_logs.fetch_add(1, std::memory_order_relaxed)
+        : 0;
+    const bool log = trace && log_index < 96;
+    if (log) {
+        std::fprintf(stderr,
+            "VITA3K_SURFACE_PRESENT_LOOKUP call=%u address=0x%08X pitch=%u viewport=%ux%u cache=%zu mapping=%u protect=%u\n",
+            log_index + 1, address.address(), pitch, viewport.width, viewport.height,
+            color_address_lookup.size(), state.features.enable_memory_mapping,
+            can_mprotect_mapped_memory);
+    }
+
     auto ite = color_address_lookup.upper_bound(address.address());
     if (ite == color_address_lookup.begin()) {
+        if (log)
+            std::fprintf(stderr, "VITA3K_SURFACE_PRESENT_MISS call=%u reason=no_lower_entry\n", log_index + 1);
         return nullptr;
     }
     --ite;
 
     ColorSurfaceCacheInfo &info = *ite->second;
-    if (info.data.address() + info.total_bytes <= address.address())
-        // they do not overlap
+    if (log) {
+        std::fprintf(stderr,
+            "VITA3K_SURFACE_PRESENT_CANDIDATE call=%u key=0x%08X data=0x%08X total=%u stride=%u size=%ux%u original=%ux%u format=%u tiling=%u last_frame=%llu need_sync=%u dirty=%u\n",
+            log_index + 1, ite->first, info.data.address(), info.total_bytes,
+            info.stride_bytes, info.width, info.height, info.original_width,
+            info.original_height, static_cast<uint32_t>(info.format),
+            static_cast<uint32_t>(info.tiling),
+            static_cast<unsigned long long>(info.last_frame_rendered),
+            info.need_surface_sync ? *info.need_surface_sync : false,
+            info.dirty ? *info.dirty : false);
+    }
+
+    if (info.data.address() + info.total_bytes <= address.address()) {
+        if (log) {
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_PRESENT_MISS call=%u reason=no_overlap end=0x%08X\n",
+                log_index + 1, info.data.address() + info.total_bytes);
+        }
         return nullptr;
+    }
 
-    if (info.stride_bytes == pitch * 4) {
-        // In assumption the format is RGBA8
-        const size_t data_delta = address.address() - ite->first;
-        uint32_t limited_height = viewport.height;
-        if ((data_delta % (pitch * 4)) == 0) {
-            uint32_t start_sourced_line = static_cast<uint32_t>((data_delta / (pitch * 4)) * state.res_multiplier);
-            if ((start_sourced_line + viewport.height) > info.height) {
-                // Sometimes the surface is just missing a little bit of lines
-                if (start_sourced_line < info.height) {
-                    // Just limit the height and display it
-                    limited_height = info.height - start_sourced_line;
-                } else {
-                    LOG_ERROR("Trying to present non-existent segment in cached color surface!");
-                    return nullptr;
-                }
+    if (info.stride_bytes != pitch * 4) {
+        if (log) {
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_PRESENT_MISS call=%u reason=stride candidate=%u requested=%u\n",
+                log_index + 1, info.stride_bytes, pitch * 4);
+        }
+        return nullptr;
+    }
+
+    const size_t data_delta = address.address() - ite->first;
+    if ((data_delta % (pitch * 4)) != 0) {
+        if (log) {
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_PRESENT_MISS call=%u reason=row_alignment delta=%zu row_bytes=%u\n",
+                log_index + 1, data_delta, pitch * 4);
+        }
+        return nullptr;
+    }
+
+    uint32_t limited_height = viewport.height;
+    uint32_t start_sourced_line = static_cast<uint32_t>((data_delta / (pitch * 4)) * state.res_multiplier);
+    if ((start_sourced_line + viewport.height) > info.height) {
+        if (start_sourced_line < info.height) {
+            limited_height = info.height - start_sourced_line;
+        } else {
+            LOG_ERROR("Trying to present non-existent segment in cached color surface!");
+            if (log) {
+                std::fprintf(stderr,
+                    "VITA3K_SURFACE_PRESENT_MISS call=%u reason=line_out_of_range start=%u height=%u\n",
+                    log_index + 1, start_sourced_line, info.height);
             }
-
-            // Compute position in texture
-            viewport.offset_x = 0;
-            viewport.offset_y = start_sourced_line;
-            viewport.width = std::min(viewport.width, static_cast<uint32_t>(info.width));
-            viewport.height = limited_height;
-            viewport.texture_width = info.width;
-            viewport.texture_height = info.height;
-
-            if (info.swizzle == vkutil::rgba_mapping && info.texture.format == vk::Format::eR8G8B8A8Unorm)
-                return info.texture.view;
-
-            if (!info.alternate_view) {
-                // create a view with the right swizzle and without gamma correction
-                vk::ImageViewCreateInfo view_info{
-                    .image = info.texture.image,
-                    .viewType = vk::ImageViewType::e2D,
-                    .format = vk::Format::eR8G8B8A8Unorm,
-                    .components = vkutil::color_to_texture_swizzle(info.swizzle, vkutil::rgba_mapping),
-                    .subresourceRange = vkutil::color_subresource_range
-                };
-                info.alternate_view = state.device.createImageView(view_info);
-            }
-
-            return info.alternate_view;
+            return nullptr;
         }
     }
 
-    return nullptr;
+    viewport.offset_x = 0;
+    viewport.offset_y = start_sourced_line;
+    viewport.width = std::min(viewport.width, static_cast<uint32_t>(info.width));
+    viewport.height = limited_height;
+    viewport.texture_width = info.width;
+    viewport.texture_height = info.height;
+
+    if (info.swizzle == vkutil::rgba_mapping && info.texture.format == vk::Format::eR8G8B8A8Unorm) {
+        if (log) {
+            std::fprintf(stderr,
+                "VITA3K_SURFACE_PRESENT_HIT call=%u view=primary offset_y=%u size=%ux%u texture=%ux%u\n",
+                log_index + 1, viewport.offset_y, viewport.width, viewport.height,
+                viewport.texture_width, viewport.texture_height);
+        }
+        return info.texture.view;
+    }
+
+    if (!info.alternate_view) {
+        vk::ImageViewCreateInfo view_info{
+            .image = info.texture.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .components = vkutil::color_to_texture_swizzle(info.swizzle, vkutil::rgba_mapping),
+            .subresourceRange = vkutil::color_subresource_range
+        };
+        info.alternate_view = state.device.createImageView(view_info);
+    }
+
+    if (log) {
+        std::fprintf(stderr,
+            "VITA3K_SURFACE_PRESENT_HIT call=%u view=alternate offset_y=%u size=%ux%u texture=%ux%u\n",
+            log_index + 1, viewport.offset_y, viewport.width, viewport.height,
+            viewport.texture_width, viewport.texture_height);
+    }
+    return info.alternate_view;
 }
 
 std::vector<uint32_t> VKSurfaceCache::dump_frame(Ptr<const void> address, uint32_t width, uint32_t height, uint32_t pitch) {

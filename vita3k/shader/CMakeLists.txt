@@ -27,3 +27,29 @@ if(TRACY_ENABLE_ON_CORE_COMPONENTS)
 	target_link_libraries(shader PRIVATE tracy)
 endif()
 
+
+if(NOT ANDROID)
+	find_package(Python3 QUIET COMPONENTS Interpreter)
+	if(Python3_Interpreter_FOUND)
+		add_test(
+			NAME shader-acxi-clip-plane-diagnostic
+			COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/tests/acxi_clip_plane_diagnostic_test.py
+				${CMAKE_SOURCE_DIR}
+		)
+		add_test(
+			NAME shader-literal-input-bit-pattern
+			COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/tests/literal_input_bit_pattern_test.py
+				${CMAKE_CURRENT_SOURCE_DIR}/include/shader/usse_types.h
+				${CMAKE_CURRENT_SOURCE_DIR}/src/gxp_parser.cpp
+				${CMAKE_CURRENT_SOURCE_DIR}/src/spirv_recompiler.cpp
+		)
+		add_test(
+			NAME shader-indexed-register-wrap
+			COMMAND ${Python3_EXECUTABLE}
+				${CMAKE_CURRENT_SOURCE_DIR}/tests/indexed_register_wrap_test.py
+				${CMAKE_SOURCE_DIR}
+		)
+	endif()
+endif()

@@ -697,6 +697,8 @@ vk::ComponentMapping translate_swizzle(SceGxmTextureFormat format) {
         return translate_swizzle4(static_cast<SceGxmTextureSwizzle4Mode>(swizzle));
 
     case SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4:
+        return translate_swizzle4_abgr(static_cast<SceGxmTextureSwizzle4Mode>(swizzle));
+
     // TODO: the following is not fully supported
     case SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5:
         return translate_swizzle4_abgr(static_cast<SceGxmTextureSwizzle4Mode>(swizzle));

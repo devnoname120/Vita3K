@@ -23,10 +23,10 @@
 #include <util/types.h>
 
 #include <atomic>
-#include <memory>
 #include <mutex>
-#include <thread>
 #include <vector>
+
+typedef struct SDL_Thread SDL_Thread;
 
 enum SceDisplayPixelFormat {
     SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 = 0x00000000U
@@ -64,7 +64,7 @@ struct DisplayState {
     DisplayFrameInfo next_rendered_frame;
 
     std::mutex mutex;
-    std::unique_ptr<std::thread> vblank_thread;
+    SDL_Thread *vblank_thread = nullptr;
     std::atomic<bool> abort{ false };
     std::atomic<bool> imgui_render{ true };
     std::atomic<bool> fullscreen{ false };

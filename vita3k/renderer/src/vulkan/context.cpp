@@ -27,6 +27,10 @@
 #include <util/log.h>
 #include <util/overloaded.h>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 namespace renderer::vulkan {
 
 void VKContext::wait_thread_function(const MemState &mem) {
@@ -396,6 +400,38 @@ void VKContext::stop_render_pass() {
     if (is_in_query) {
         render_cmd.endQuery(current_visibility_buffer->query_pool, current_query_idx);
         is_in_query = false;
+    }
+
+    static const bool force_green = [] {
+        const char *value = std::getenv("VITA3K_ASPHALT_RENDERPASS_GREEN");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    static std::atomic<uint32_t> force_green_logs{ 0 };
+    if (force_green && current_color_view) {
+        vk::ClearAttachment attachment{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .colorAttachment = 0,
+            .clearValue = {
+                .color = { std::array<float, 4>{ 0.0f, 1.0f, 0.0f, 1.0f } } }
+        };
+        vk::ClearRect rect{
+            .rect = curr_renderpass_info.renderArea,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        };
+        render_cmd.clearAttachments(attachment, rect);
+        const uint32_t log_index = force_green_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 32) {
+            std::fprintf(stderr,
+                "VITA3K_ASPHALT_RENDERPASS_GREEN call=%u area=%d,%d %ux%u target=%ux%u scissor=%d,%d %ux%u\n",
+                log_index + 1,
+                rect.rect.offset.x, rect.rect.offset.y,
+                rect.rect.extent.width, rect.rect.extent.height,
+                render_target ? render_target->width : 0,
+                render_target ? render_target->height : 0,
+                scissor.offset.x, scissor.offset.y,
+                scissor.extent.width, scissor.extent.height);
+        }
     }
 
     render_cmd.endRenderPass();

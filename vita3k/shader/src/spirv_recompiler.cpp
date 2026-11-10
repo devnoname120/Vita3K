@@ -1002,7 +1002,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
     if (program_type == SceGxmProgramType::Vertex) {
         // Create the default reg uniform buffer
-        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1022,6 +1022,9 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
         ADD_VERT_UNIFORM_MEMBER(viewport_flip);
         ADD_VERT_UNIFORM_MEMBER(viewport_flag);
+        ADD_VERT_UNIFORM_MEMBER(w_clamp_enabled);
+        ADD_VERT_UNIFORM_MEMBER(w_clamp_value);
+        ADD_VERT_UNIFORM_MEMBER(post_viewport_clip);
         ADD_VERT_UNIFORM_MEMBER(screen_width);
         ADD_VERT_UNIFORM_MEMBER(screen_height);
         ADD_VERT_UNIFORM_MEMBER(z_offset);
@@ -1306,7 +1309,11 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     for (const auto &input : program_input.inputs) {
         std::visit(overloaded{
                        [&](const LiteralInputSource &s) {
-                           literal_pairs.emplace_back(input.offset, b.makeFloatConstant(s.data));
+                           // GXP literals are register payloads. A float constant can be folded to a
+                           // denormal literal and flushed before a later integer bitcast on Metal.
+                           const spv::Id bits = b.makeUintConstant(s.data_bits);
+                           literal_pairs.emplace_back(input.offset,
+                               b.createUnaryOp(spv::OpBitcast, f32_type, bits));
                            // Pair sort automatically sort offset for us
                            std::sort(literal_pairs.begin(), literal_pairs.end());
                        },
@@ -1398,8 +1405,8 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
             // Create new literal composite
             spv::Id composite_var;
             if (constituents.size() > 1) {
-                composite_var = b.makeCompositeConstant(b.makeVectorType(f32_type, static_cast<int>(constituents.size())),
-                    constituents);
+                composite_var = b.createCompositeConstruct(
+                    b.makeVectorType(f32_type, static_cast<int>(constituents.size())), constituents);
             } else {
                 composite_var = constituents[0];
             }
@@ -1635,6 +1642,16 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP6, "v_Clip6", 1);
     // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP7, "v_Clip7", 1);
 
+    spv::Id clip_distance_var = spv::NoResult;
+    if (translation_state.is_vulkan && translation_state.render_info_id != spv::NoResult) {
+        b.addCapability(spv::CapabilityClipDistance);
+        const spv::Id f32 = b.makeFloatType(32);
+        const spv::Id clip_distance_type = b.makeArrayType(f32, b.makeUintConstant(6), 0);
+        clip_distance_var = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, clip_distance_type, "gl_ClipDistance");
+        b.addDecoration(clip_distance_var, spv::DecorationBuiltIn, spv::BuiltInClipDistance);
+        translation_state.interfaces.push_back(clip_distance_var);
+    }
+
     Operand o_op;
     o_op.bank = RegisterBank::OUTPUT;
     o_op.num = 0;
@@ -1724,27 +1741,71 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                     flip_vec_id = b.createLoad(flip_vec_id, spv::NoPrecision);
                     o_val = b.createBinOp(spv::OpFMul, out_type, o_val, flip_vec_id);
                 }
-                b.createStore(o_val, out_var);
-
-                // scale the depth and w coordinate
+                // Preserve the host clip coordinate while reproducing GXM's clamped viewport divisor.
                 if (translation_state.render_info_id != spv::NoResult) {
-                    spv::Id z_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(2) });
-                    spv::Id w_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(3) });
-                    spv::Id z = b.createLoad(z_ref, spv::NoPrecision);
-                    const spv::Id w = b.createLoad(w_ref, spv::NoPrecision);
+                    const spv::Id original_x = b.createCompositeExtract(o_val, f32, 0);
+                    const spv::Id original_y = b.createCompositeExtract(o_val, f32, 1);
+                    const spv::Id original_z = b.createCompositeExtract(o_val, f32, 2);
+                    const spv::Id original_w = b.createCompositeExtract(o_val, f32, 3);
+                    spv::Id w_clamp_enabled = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_w_clamp_enabled) });
+                    spv::Id w_clamp_value = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_w_clamp_value) });
+                    spv::Id post_viewport_clip = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_post_viewport_clip) });
+                    w_clamp_enabled = b.createLoad(w_clamp_enabled, spv::NoPrecision);
+                    w_clamp_value = b.createLoad(w_clamp_value, spv::NoPrecision);
+                    post_viewport_clip = b.createLoad(post_viewport_clip, spv::NoPrecision);
+                    const spv::Id w_clamp_pred = b.createOp(spv::OpFOrdGreaterThan, b.makeBoolType(), { w_clamp_enabled, half });
+                    const spv::Id post_viewport_clip_pred = b.createOp(spv::OpFOrdGreaterThan, b.makeBoolType(), { post_viewport_clip, half });
+                    const spv::Id force_clip_reject_pred = b.createOp(
+                        spv::OpFOrdEqual, b.makeBoolType(), { post_viewport_clip, two });
+                    const spv::Id clamped_w = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { original_w, w_clamp_value });
+                    const spv::Id viewport_divisor = b.createOp(spv::OpSelect, f32, { w_clamp_pred, clamped_w, original_w });
+                    if (clip_distance_var != spv::NoResult) {
+                        const spv::Id clip_x_min = b.createBinOp(spv::OpFAdd, f32, original_x, original_w);
+                        const spv::Id clip_x_max = b.createBinOp(spv::OpFSub, f32, original_w, original_x);
+                        const spv::Id clip_y_min = b.createBinOp(spv::OpFAdd, f32, original_y, original_w);
+                        const spv::Id clip_y_max = b.createBinOp(spv::OpFSub, f32, original_w, original_y);
+                        const spv::Id clip_z_min = b.createBinOp(spv::OpFAdd, f32, original_z, original_w);
+                        const spv::Id clip_z_max = b.createBinOp(spv::OpFSub, f32, original_w, original_z);
+                        const std::array<spv::Id, 6> clip_distances = {
+                            clip_x_min, clip_x_max, clip_y_min, clip_y_max, clip_z_min, clip_z_max
+                        };
+                        for (uint32_t index = 0; index < clip_distances.size(); ++index) {
+                            const spv::Id clip_distance = clip_distances[index];
+                            const spv::Id selected_clip_distance = b.createOp(spv::OpSelect, f32, { post_viewport_clip_pred, clip_distance, one });
+                            const spv::Id force_clip_plane_pred = b.createOp(
+                                spv::OpFOrdEqual, b.makeBoolType(),
+                                { post_viewport_clip, b.makeFloatConstant(3.0f + static_cast<float>(index)) });
+                            const spv::Id force_clip_pred = b.createOp(
+                                spv::OpLogicalOr, b.makeBoolType(), { force_clip_reject_pred, force_clip_plane_pred });
+                            const spv::Id explicit_clip_distance = b.createOp(
+                                spv::OpSelect, f32, { force_clip_pred, neg_one, selected_clip_distance });
+                            const spv::Id clip_distance_ref = utils::create_access_chain(
+                                b, spv::StorageClassOutput, clip_distance_var, { b.makeIntConstant(index) });
+                            b.createStore(explicit_clip_distance, clip_distance_ref);
+                        }
+                    }
+                    const spv::Id viewport_scale = b.createBinOp(spv::OpFDiv, f32, original_w, viewport_divisor);
+                    const spv::Id viewport_scale_v4 = b.createCompositeConstruct(v4, { viewport_scale, viewport_scale, one, one });
+                    const spv::Id host_clip_position = b.createBinOp(spv::OpFMul, out_type, o_val, viewport_scale_v4);
+                    o_val = host_clip_position;
+                    b.createStore(o_val, out_var);
 
+                    spv::Id z_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(2) });
+                    spv::Id z = original_z;
                     spv::Id z_offset = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_z_offset) });
                     spv::Id z_scale = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_z_scale) });
                     z_offset = b.createLoad(z_offset, spv::NoPrecision);
                     z_scale = b.createLoad(z_scale, spv::NoPrecision);
 
                     // screen_z = z_offset + z_scale * (z / w)
-                    z = b.createBinOp(spv::OpFDiv, f32, z, w);
+                    z = b.createBinOp(spv::OpFDiv, f32, z, viewport_divisor);
                     z = b.createBinOp(spv::OpFMul, f32, z, z_scale);
                     z = b.createBinOp(spv::OpFAdd, f32, z, z_offset);
 
-                    // z values below 0 get clamped
-                    z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, zero });
+                    // GXM applies the depth floor after its post-viewport clipper.
+                    const spv::Id unclamped_screen_z = z;
+                    const spv::Id depth_clamped_z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { unclamped_screen_z, zero });
+                    z = b.createOp(spv::OpSelect, f32, { post_viewport_clip_pred, unclamped_screen_z, depth_clamped_z });
 
                     if (!translation_state.is_vulkan) {
                         // convert [0,1] depth range (gxp, vulkan) to [-1,1] depth range (opengl)
@@ -1752,10 +1813,11 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                         z = b.createBinOp(spv::OpFAdd, f32, z, b.makeFloatConstant(-1.0f));
                     }
 
-                    // multiply by w because it will be re-divided by w during screen normalization
-                    z = b.createBinOp(spv::OpFMul, f32, z, w);
+                    z = b.createBinOp(spv::OpFMul, f32, z, original_w);
 
                     b.createStore(z, z_ref);
+                } else {
+                    b.createStore(o_val, out_var);
                 }
 
                 cond_builder.makeEndIf();
@@ -1839,7 +1901,7 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
     const unsigned int spv_version = translation_state.is_vulkan ? spv::Spv_1_0 : spv::Spv_1_3;
 
     spv::SpvBuildLogger spv_logger;
-    spv::Builder b(spv_version, 0x1337 << 12, &spv_logger);
+    spv::Builder b(spv_version, 0, &spv_logger);
     b.setEmitSpirvDebugInfo();
     b.setDebugMainSourceFile(shader_hash);
     b.addSourceExtension("gxp");

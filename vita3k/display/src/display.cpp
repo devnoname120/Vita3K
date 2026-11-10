@@ -24,6 +24,10 @@
 #include <renderer/state.h>
 
 #include <chrono>
+#include <cstdlib>
+
+#include <SDL3/SDL_thread.h>
+
 #include <motion/functions.h>
 #include <touch/functions.h>
 
@@ -73,8 +77,30 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
     }
 }
 
+static int SDLCALL vblank_sync_thread_entry(void *data) {
+    vblank_sync_thread(*static_cast<EmuEnvState *>(data));
+    return 0;
+}
+
 void start_sync_thread(EmuEnvState &emuenv) {
-    emuenv.display.vblank_thread = std::make_unique<std::thread>(vblank_sync_thread, std::ref(emuenv));
+    SDL_Thread *thread = nullptr;
+    const char *ttbr_hle_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    if (ttbr_hle_title && *ttbr_hle_title) {
+        const SDL_PropertiesID properties = SDL_CreateProperties();
+        if (properties) {
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,
+                reinterpret_cast<void *>(&vblank_sync_thread_entry));
+            SDL_SetStringProperty(properties, SDL_PROP_THREAD_CREATE_NAME_STRING, "Vita3K VBlank");
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, &emuenv);
+            SDL_SetNumberProperty(properties, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER,
+                8 * 1024 * 1024);
+            thread = SDL_CreateThreadWithProperties(properties);
+            SDL_DestroyProperties(properties);
+        }
+    }
+    if (!thread)
+        thread = SDL_CreateThread(&vblank_sync_thread_entry, "Vita3K VBlank", &emuenv);
+    emuenv.display.vblank_thread = thread;
 }
 
 void wait_vblank(DisplayState &display, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb) {
@@ -192,10 +218,10 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
 
 void DisplayState::deinit() {
     abort = true;
-    if (vblank_thread && vblank_thread->joinable())
-        vblank_thread->join();
+    if (vblank_thread)
+        SDL_WaitThread(vblank_thread, nullptr);
 
-    vblank_thread.reset();
+    vblank_thread = nullptr;
     abort = false;
 
     {

@@ -109,6 +109,19 @@ public:
 
     // Allocate new data from ring buffer
     void allocate(const uint32_t data_size);
+
+    bool will_wrap(uint32_t data_size) const {
+        return cursor > capacity || data_size > capacity - cursor;
+    }
+
+    uint32_t used_bytes() const {
+        return cursor == ~uint32_t{ 0 } ? 0 : cursor;
+    }
+
+    uint32_t capacity_bytes() const {
+        return capacity;
+    }
+
     // copy the content to the framebuffer
     // cmd_buffer may not be used
     virtual void copy(vk::CommandBuffer cmd_buffer, const uint32_t size, const void *data, const uint32_t offset = 0) = 0;
@@ -151,6 +164,16 @@ public:
     void create() override;
 
     void copy(vk::CommandBuffer cmd_buffer, const uint32_t size, const void *data, const uint32_t offset = 0) override;
+
+    const uint8_t *mapped_at(uint32_t offset = 0) const {
+        if (!buffer.mapped_data || offset >= buffer.size)
+            return nullptr;
+        return static_cast<const uint8_t *>(buffer.mapped_data) + offset;
+    }
+
+    vk::DeviceSize mapped_size() const {
+        return buffer.size;
+    }
 };
 
 // Queue that contains GPU objects that are planned to be destroyed (deferred destruction)

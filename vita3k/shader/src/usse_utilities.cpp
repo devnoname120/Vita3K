@@ -30,6 +30,8 @@
 
 namespace shader::usse::utils {
 
+static constexpr int INDEXED_UNIFIED_STORE_MASK = 0x7F;
+
 static spv::Id get_correspond_constant_with_channel(spv::Builder &b, shader::usse::SwizzleChannel swizz) {
     switch (swizz) {
     case shader::usse::SwizzleChannel::C_0: {
@@ -1127,12 +1129,20 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
         // Calculate the "at" offset.
         spv::Id idx_reg_val = b.createLoad(b.createOp(spv::OpAccessChain, b.makePointer(spv::StorageClassPrivate, type_i32), { params.indexes, b.makeIntConstant(idx_off) }), spv::NoPrecision);
 
-        spv::Id real_idx = b.createBinOp(spv::OpIAdd, type_i32, b.createBinOp(spv::OpIMul, type_i32, idx_reg_val, b.makeIntConstant(2)), b.makeIntConstant(add_off));
+        const spv::Id scalar_idx = op.is_double_regs
+            ? b.createBinOp(spv::OpIMul, type_i32, idx_reg_val, b.makeIntConstant(2))
+            : idx_reg_val;
+        const spv::Id unwrapped_idx = b.createBinOp(spv::OpIAdd, type_i32,
+            scalar_idx, b.makeIntConstant(add_off));
+        const spv::Id real_idx = b.createBinOp(spv::OpBitwiseAnd, type_i32, unwrapped_idx,
+            b.makeIntConstant(INDEXED_UNIFIED_STORE_MASK));
         finalize_offset = real_idx;
 
+        const spv::Id wrapped_friend_idx = b.createBinOp(spv::OpBitwiseAnd, type_i32,
+            b.createBinOp(spv::OpIAdd, type_i32, real_idx, b.makeIntConstant(3)),
+            b.makeIntConstant(INDEXED_UNIFIED_STORE_MASK));
         idx_in_arr_1 = b.createBinOp(spv::OpSDiv, type_i32, real_idx, b.makeIntConstant(4));
-        idx_in_arr_2 = b.createBinOp(spv::OpSDiv, type_i32, b.createBinOp(spv::OpIAdd, type_i32, real_idx, b.makeIntConstant(3)),
-            b.makeIntConstant(4));
+        idx_in_arr_2 = b.createBinOp(spv::OpSDiv, type_i32, wrapped_friend_idx, b.makeIntConstant(4));
     }
 
     const int num_comp_in_single_float = get_packed_component_count(op.type);

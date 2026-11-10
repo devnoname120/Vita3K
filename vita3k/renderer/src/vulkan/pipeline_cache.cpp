@@ -28,8 +28,11 @@
 
 #include <util/fs.h>
 #include <util/log.h>
+#include <vkutil/vkutil.h>
 
 #include <SDL3/SDL_cpuinfo.h>
+
+#include <cstdlib>
 
 // don't use the dispatch version, because we always hash a small amount
 // with a known size
@@ -488,7 +491,48 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
     }
 
     if (*shader_module == shader_compiling) {
-        precompile_shader(hash, false);
+        const std::string diagnostic_hash = hex_string(hash);
+        const char *override_hash_value = std::getenv(is_vertex
+                ? "VITA3K_SHADER_OVERRIDE_VERTEX_HASH"
+                : "VITA3K_SHADER_OVERRIDE_FRAGMENT_HASH");
+        const char *override_path_value = std::getenv(is_vertex
+                ? "VITA3K_SHADER_OVERRIDE_VERTEX_SPV"
+                : "VITA3K_SHADER_OVERRIDE_FRAGMENT_SPV");
+        const bool exact_override = override_hash_value && *override_hash_value
+            && override_path_value && *override_path_value
+            && diagnostic_hash == override_hash_value;
+        if (exact_override) {
+            const fs::path override_path = override_path_value;
+            const vk::ShaderModule override_module = vkutil::load_shader(state.device, override_path);
+            if (override_module) {
+                *shader_module = override_module;
+                LOG_WARN("Shader diagnostic: replaced {} shader {} from {}",
+                    is_vertex ? "vertex" : "fragment", diagnostic_hash, override_path.string());
+            } else {
+                LOG_ERROR("Shader diagnostic: failed to load {} shader {} from {}; using translated shader",
+                    is_vertex ? "vertex" : "fragment", diagnostic_hash, override_path.string());
+                precompile_shader(hash, false);
+            }
+        } else {
+            const char *diagnostic_mode_value = std::getenv("VITA3K_BLOONS_SHADER_DIAG");
+            const std::string diagnostic_mode = diagnostic_mode_value ? diagnostic_mode_value : "";
+            const bool replace_vertex = diagnostic_mode == "vertex" || diagnostic_mode == "both";
+            const bool replace_fragment = diagnostic_mode == "fragment" || diagnostic_mode == "both";
+            const bool diagnostic_vertex = replace_vertex && is_vertex
+                && diagnostic_hash == "58e3c28cf7fcd1902e3019eb26e3852ee3d1c16441bf2222c483c91e0d603758";
+            const bool diagnostic_fragment = replace_fragment && !is_vertex
+                && diagnostic_hash == "48f3df95160b4979e9a4bc1ea86e9a28675f474e22b0dd11417c1c64afc11c5e";
+            if (diagnostic_vertex || diagnostic_fragment) {
+                const fs::path diagnostic_path = diagnostic_vertex
+                    ? "/tmp/bloons_diag_clear.vert.spv"
+                    : "/tmp/bloons_diag_clear.frag.spv";
+                *shader_module = vkutil::load_shader(state.device, diagnostic_path);
+                LOG_WARN("Bloons shader diagnostic: replaced {} shader {} from {}",
+                    diagnostic_vertex ? "vertex" : "fragment", diagnostic_hash, diagnostic_path.string());
+            } else {
+                precompile_shader(hash, false);
+            }
+        }
     }
 
     if (*shader_module != shader_compiling) {
@@ -838,10 +882,22 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     const bool two_sided = (record.two_sided == SCE_GXM_TWO_SIDED_ENABLED);
 
     const bool use_shader_interlock = state.features.support_shader_interlock && gxm_fragment_shader->is_frag_color_used();
+    const bool sixty_composite_pair
+        = hex_string(vertex_program.hash) == "1ed37f037294fd954438847fc53eb4eaa1602747c5f5e0262e68a210082f6353"
+        && hex_string(fragment_program.hash) == "eca96fb5d9b62e549a89a583e7c738f1194db271ae81e919deec8845623e220b";
+    const char *const sixty_composite_cull_env = std::getenv("VITA3K_SIXTY_DISABLE_COMPOSITE_CULL");
+    const bool sixty_disable_composite_cull = sixty_composite_pair && sixty_composite_cull_env
+        && sixty_composite_cull_env[0] == '1' && sixty_composite_cull_env[1] == 0;
+    const char *const sixty_composite_depth_stencil_env = std::getenv("VITA3K_SIXTY_DISABLE_COMPOSITE_DEPTH_STENCIL");
+    const bool sixty_disable_composite_depth_stencil = sixty_composite_pair && sixty_composite_depth_stencil_env
+        && sixty_composite_depth_stencil_env[0] == '1' && sixty_composite_depth_stencil_env[1] == 0;
+    const vk::CullModeFlags cull_mode = sixty_disable_composite_cull
+        ? vk::CullModeFlagBits::eNone
+        : translate_cull_mode(record.cull_mode);
 
     const vk::PipelineRasterizationStateCreateInfo rasterizer{
         .polygonMode = translate_polygon_mode(record.front_polygon_mode),
-        .cullMode = translate_cull_mode(record.cull_mode),
+        .cullMode = cull_mode,
         // front face is always counter clockwise
         .frontFace = vk::FrontFace::eCounterClockwise,
         .depthBiasEnable = VK_TRUE,
@@ -853,11 +909,13 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     // depth and stencil tests are always enabled on the ps vita as there is almost no cost in doing so
     // on a tiled renderer
     const vk::PipelineDepthStencilStateCreateInfo ds_info{
-        .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = (record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED),
+        .depthTestEnable = sixty_disable_composite_depth_stencil ? VK_FALSE : VK_TRUE,
+        .depthWriteEnable = sixty_disable_composite_depth_stencil
+            ? VK_FALSE
+            : (record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED),
         .depthCompareOp = translate_depth_func(record.front_depth_func),
         .depthBoundsTestEnable = VK_FALSE,
-        .stencilTestEnable = VK_TRUE,
+        .stencilTestEnable = sixty_disable_composite_depth_stencil ? VK_FALSE : VK_TRUE,
         .front = convert_op_state(record.front_stencil_state_op),
         .back = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op)
     };
@@ -919,13 +977,17 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
         .subpass = 0
     };
 
-    const auto result = state.device.createGraphicsPipeline(pipeline_cache, pipeline_info);
-    if (result.result != vk::Result::eSuccess) {
-        LOG_CRITICAL("Failed to create pipeline.");
+    vk::Pipeline pipeline;
+    const vk::Result result = state.device.createGraphicsPipelines(
+        pipeline_cache, 1, &pipeline_info, nullptr, &pipeline);
+    if (result != vk::Result::eSuccess) {
+        LOG_ERROR("Failed to create Vulkan pipeline: {} vertex={} fragment={} vertex_outputs=0x{:08X}",
+            vk::to_string(result), hex_string(vertex_program.hash), hex_string(fragment_program.hash),
+            static_cast<uint32_t>(gxp::get_vertex_outputs(*vertex_program_gxm.program.get(mem), nullptr)));
         return nullptr;
     }
 
-    return result.value;
+    return pipeline;
 }
 
 vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem) {
@@ -1015,6 +1077,33 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
 }
 
 vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool search_first) {
+    const std::string diagnostic_hash = hex_string(hash);
+    const char *const vertex_override_hash = std::getenv("VITA3K_SHADER_OVERRIDE_VERTEX_HASH");
+    const char *const vertex_override_path = std::getenv("VITA3K_SHADER_OVERRIDE_VERTEX_SPV");
+    const char *const fragment_override_hash = std::getenv("VITA3K_SHADER_OVERRIDE_FRAGMENT_HASH");
+    const char *const fragment_override_path = std::getenv("VITA3K_SHADER_OVERRIDE_FRAGMENT_SPV");
+    const bool vertex_override = vertex_override_hash && *vertex_override_hash
+        && vertex_override_path && *vertex_override_path
+        && diagnostic_hash == vertex_override_hash;
+    const bool fragment_override = fragment_override_hash && *fragment_override_hash
+        && fragment_override_path && *fragment_override_path
+        && diagnostic_hash == fragment_override_hash;
+    if (vertex_override || fragment_override) {
+        const fs::path override_path = vertex_override ? vertex_override_path : fragment_override_path;
+        const vk::ShaderModule override_module = vkutil::load_shader(state.device, override_path);
+        if (override_module) {
+            std::lock_guard<std::mutex> guard(shaders_mutex);
+            shaders[hash] = override_module;
+            std::fprintf(stderr, "VITA3K_SHADER_OVERRIDE_PRECOMPILE stage=%s hash=%s path=%s\n",
+                vertex_override ? "vertex" : "fragment", diagnostic_hash.c_str(), override_path.c_str());
+            std::fflush(stderr);
+            return override_module;
+        }
+        std::fprintf(stderr, "VITA3K_SHADER_OVERRIDE_PRECOMPILE_FAILED stage=%s hash=%s path=%s\n",
+            vertex_override ? "vertex" : "fragment", diagnostic_hash.c_str(), override_path.c_str());
+        std::fflush(stderr);
+    }
+
     if (search_first) {
         // happens while loading the thread, no parallel access so no need for a mutex
         auto it = shaders.find(hash);

@@ -23,9 +23,250 @@
 #include <config/state.h>
 #include <spdlog/fmt/bin_to_hex.h>
 
+#include <charconv>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+
+#include "draw_probe_dump.h"
+#include "nba2k16_crowd_uniform_trace.h"
+#include "stream_ring_wrap_sync.h"
 #include <util/log.h>
 
 namespace renderer::vulkan {
+
+static bool doubledragon_target_vertex_program(const ShaderProgram *program) {
+    static constexpr uint8_t target_hash_prefix[] = { 0x2e, 0x41, 0xa6, 0x5f, 0xc8, 0x67, 0xfd, 0xc7 };
+    return program && std::memcmp(program->hash.data(), target_hash_prefix, sizeof(target_hash_prefix)) == 0;
+}
+
+static bool doubledragon_viewport_trace_enabled() {
+    const char *const value = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    return value && value[0] == '1' && value[1] == 0;
+}
+
+static bool bloonstd5hd_retry_first_textured_draw() {
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    const char *const title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    return title && std::strcmp(title, "BIOS00001") == 0;
+#else
+    return false;
+#endif
+}
+
+static bool acxi_skip_hangar_environment_draw(const VKContext &context, const MemState &mem, const Config &config) {
+    if (config.run_app_path != "ACXI00001")
+        return false;
+    const char *const expected_hash = std::getenv("VITA3K_ACXI_SKIP_VERTEX_HASH");
+    const char *const trigger = std::getenv("VITA3K_ACXI_SKIP_TRIGGER");
+    const char *const range = std::getenv("VITA3K_ACXI_SKIP_DRAW_RANGE");
+    const char *const keep_range = std::getenv("VITA3K_ACXI_KEEP_DRAW_RANGE");
+    const bool keep_selected_range = keep_range && keep_range[0] == '1' && keep_range[1] == 0;
+    if (!expected_hash || !*expected_hash || !trigger || !*trigger || !range || !*range)
+        return false;
+    std::error_code error;
+    if (!std::filesystem::exists(trigger, error) || error)
+        return false;
+
+    std::string selected_range = range;
+    std::ifstream control(trigger);
+    std::string control_range;
+    if (std::getline(control, control_range) && !control_range.empty())
+        selected_range = std::move(control_range);
+    const char *const range_begin = selected_range.data();
+    const char *const range_end = range_begin + selected_range.size();
+    const char *const separator = std::find(range_begin, range_end, ':');
+    uint64_t first_draw = 0;
+    uint64_t last_draw = 0;
+    if (separator == range_begin || separator == range_end || separator + 1 == range_end)
+        return false;
+    const auto [first_end, first_error] = std::from_chars(range_begin, separator, first_draw);
+    const auto [last_end, last_error] = std::from_chars(separator + 1, range_end, last_draw);
+    if (first_error != std::errc() || last_error != std::errc()
+        || first_end != separator || last_end != range_end
+        || first_draw == 0 || last_draw < first_draw)
+        return false;
+
+    static thread_local uint64_t matching_scene_timestamp = 0;
+    static thread_local uint64_t matching_draw_index = 0;
+    if (matching_scene_timestamp != context.scene_timestamp) {
+        matching_scene_timestamp = context.scene_timestamp;
+        matching_draw_index = 0;
+    }
+    const auto *const vertex_program = context.record.vertex_program.get(mem);
+    const bool matches_environment = vertex_program
+        && hex_string(vertex_program->renderer_data->hash) == expected_hash;
+    if (!matches_environment)
+        return false;
+    ++matching_draw_index;
+    const bool inside_selected_range = matching_draw_index >= first_draw && matching_draw_index <= last_draw;
+    const bool outside_selected_range = matching_draw_index < first_draw || matching_draw_index > last_draw;
+    const bool skip = keep_selected_range ? outside_selected_range : inside_selected_range;
+    if (skip && (matching_draw_index == first_draw || matching_draw_index == last_draw)) {
+        std::fprintf(stderr,
+            "VITA3K_ACXI_SKIP_HANGAR scene=%llu draw=%llu range=%llu:%llu vertex=%s\n",
+            static_cast<unsigned long long>(context.scene_timestamp),
+            static_cast<unsigned long long>(matching_draw_index),
+            static_cast<unsigned long long>(first_draw),
+            static_cast<unsigned long long>(last_draw), expected_hash);
+        std::fflush(stderr);
+    }
+    return skip;
+}
+
+static bool nba2k16_skip_draw_range(const VKContext &context, const MemState &mem, const Config &config,
+    SceGxmPrimitiveType type, size_t count, uint32_t instance_count) {
+    if (config.run_app_path != "NBA2K1601")
+        return false;
+
+    static thread_local uint64_t scene_timestamp = std::numeric_limits<uint64_t>::max();
+    static thread_local uint64_t draw_index = 0;
+    if (scene_timestamp != context.scene_timestamp) {
+        scene_timestamp = context.scene_timestamp;
+        draw_index = 0;
+    }
+    ++draw_index;
+
+    const char *const control_path = std::getenv("VITA3K_NBA2K16_DRAW_CONTROL");
+    const char *const range = std::getenv("VITA3K_NBA2K16_DRAW_RANGE");
+    const char *const keep_range = std::getenv("VITA3K_NBA2K16_KEEP_DRAW_RANGE");
+    const bool keep_selected_range = keep_range && keep_range[0] == '1' && keep_range[1] == 0;
+    if (!control_path || !*control_path || !range || !*range)
+        return false;
+    std::error_code error;
+    if (!std::filesystem::exists(control_path, error) || error)
+        return false;
+
+    const auto *const vertex_program = context.record.vertex_program.get(mem);
+    const auto *const fragment_program = context.record.fragment_program.get(mem);
+    const std::string vertex_hash = vertex_program
+        ? hex_string(vertex_program->renderer_data->hash) : std::string("none");
+    const std::string fragment_hash = fragment_program
+        ? hex_string(fragment_program->renderer_data->hash) : std::string("none");
+    const char *const trace = std::getenv("VITA3K_NBA2K16_DRAW_TRACE");
+    if (trace && trace[0] == '1' && trace[1] == 0) {
+        std::fprintf(stderr,
+            "VITA3K_NBA2K16_DRAW frame=%llu scene=%llu draw=%llu count=%zu instances=%u primitive=%u target=%ux%u vertex=%s fragment=%s\n",
+            static_cast<unsigned long long>(context.frame_timestamp),
+            static_cast<unsigned long long>(context.scene_timestamp),
+            static_cast<unsigned long long>(draw_index), count, instance_count,
+            static_cast<unsigned>(type), context.render_target->width,
+            context.render_target->height, vertex_hash.c_str(), fragment_hash.c_str());
+        std::fflush(stderr);
+    }
+
+    std::string selected_range = range;
+    std::ifstream control(control_path);
+    std::string control_range;
+    if (std::getline(control, control_range) && !control_range.empty())
+        selected_range = control_range;
+
+    bool exact_shader_skip = false;
+    bool exact_shader_selector = false;
+    if (control_range.rfind("vertex:", 0) == 0) {
+        exact_shader_selector = true;
+        exact_shader_skip = vertex_hash == control_range.substr(7);
+    } else if (control_range.rfind("fragment:", 0) == 0) {
+        exact_shader_selector = true;
+        exact_shader_skip = fragment_hash == control_range.substr(9);
+    } else if (control_range.rfind("pair:", 0) == 0) {
+        exact_shader_selector = true;
+        const size_t pair_separator = control_range.find(':', 5);
+        exact_shader_skip = pair_separator != std::string::npos
+            && vertex_hash == control_range.substr(5, pair_separator - 5)
+            && fragment_hash == control_range.substr(pair_separator + 1);
+    }
+    if (exact_shader_selector) {
+        if (exact_shader_skip) {
+            std::fprintf(stderr,
+                "VITA3K_NBA2K16_DRAW_SHADER_SKIP scene=%llu draw=%llu selector=%s vertex=%s fragment=%s\n",
+                static_cast<unsigned long long>(context.scene_timestamp),
+                static_cast<unsigned long long>(draw_index), control_range.c_str(),
+                vertex_hash.c_str(), fragment_hash.c_str());
+            std::fflush(stderr);
+        }
+        return exact_shader_skip;
+    }
+
+    const char *const range_begin = selected_range.data();
+    const char *const range_end = range_begin + selected_range.size();
+    const char *const separator = std::find(range_begin, range_end, ':');
+    uint64_t first_draw = 0;
+    uint64_t last_draw = 0;
+    if (separator == range_begin || separator == range_end || separator + 1 == range_end)
+        return false;
+    const auto [first_end, first_error] = std::from_chars(range_begin, separator, first_draw);
+    const auto [last_end, last_error] = std::from_chars(separator + 1, range_end, last_draw);
+    if (first_error != std::errc() || last_error != std::errc()
+        || first_end != separator || last_end != range_end
+        || first_draw == 0 || last_draw < first_draw)
+        return false;
+
+    const bool inside_selected_range = draw_index >= first_draw && draw_index <= last_draw;
+    const bool outside_selected_range = draw_index < first_draw || draw_index > last_draw;
+    const bool skip = keep_selected_range ? outside_selected_range : inside_selected_range;
+    if (skip && (draw_index == first_draw || draw_index == last_draw)) {
+        std::fprintf(stderr,
+            "VITA3K_NBA2K16_DRAW_SKIP scene=%llu draw=%llu range=%llu:%llu keep=%u vertex=%s fragment=%s\n",
+            static_cast<unsigned long long>(context.scene_timestamp),
+            static_cast<unsigned long long>(draw_index),
+            static_cast<unsigned long long>(first_draw),
+            static_cast<unsigned long long>(last_draw), static_cast<unsigned>(keep_selected_range),
+            vertex_hash.c_str(), fragment_hash.c_str());
+        std::fflush(stderr);
+    }
+    return skip;
+}
+
+static int acxi_force_clip_plane(const Config &config, const Sha256Hash &vertex_hash) {
+    if (config.run_app_path != "ACXI00001")
+        return -1;
+    const char *const control_path = std::getenv("VITA3K_ACXI_FORCE_CLIP_PLANE_FILE");
+    const char *const expected_hash = std::getenv("VITA3K_ACXI_FORCE_CLIP_VERTEX_HASH");
+    if (!control_path || !*control_path || !expected_hash || !*expected_hash
+        || hex_string(vertex_hash) != expected_hash)
+        return -1;
+
+    std::ifstream control(control_path);
+    std::string selection;
+    if (!std::getline(control, selection) || selection.empty())
+        return -1;
+    int plane = -1;
+    const char *const begin = selection.data();
+    const char *const end = begin + selection.size();
+    const auto [parsed_end, error] = std::from_chars(begin, end, plane);
+    if (error != std::errc() || parsed_end != end || plane < 0 || plane > 5)
+        return -1;
+    return plane;
+}
+
+static bool minigore_clear_trace_enabled() {
+    const char *const value = std::getenv("VITA3K_MINIGORE_CLEAR_TRACE");
+    return value && value[0] == '1' && value[1] == 0;
+}
+
+static bool minigore_clear_hash_pair(const ShaderProgram *vertex, const ShaderProgram *fragment) {
+    static constexpr uint8_t vertex_hash_prefix[] = { 0x58, 0xe3, 0xc2, 0x8c, 0xf7, 0xfc, 0xd1, 0x90 };
+    static constexpr uint8_t fragment_hash_prefix[] = { 0x48, 0xf3, 0xdf, 0x95, 0x16, 0x0b, 0x49, 0x79 };
+    return vertex && fragment
+        && std::memcmp(vertex->hash.data(), vertex_hash_prefix, sizeof(vertex_hash_prefix)) == 0
+        && std::memcmp(fragment->hash.data(), fragment_hash_prefix, sizeof(fragment_hash_prefix)) == 0;
+}
+
+static void minigore_clear_trace_bytes(const uint8_t *bytes, size_t size) {
+    for (size_t index = 0; bytes && index < size; ++index)
+        std::fprintf(stderr, "%02X", bytes[index]);
+    std::fputc('\n', stderr);
+}
+
+static void doubledragon_trace_bytes(const uint8_t *bytes, size_t size) {
+    for (size_t index = 0; bytes && index < size; ++index)
+        std::fprintf(stderr, "%02X", bytes[index]);
+    std::fputc('\n', stderr);
+}
 
 void set_uniform_buffer(VKContext &context, MemState &mem, const ShaderProgram *program, const bool vertex_shader, const int block_num, const int size, Ptr<uint8_t> data) {
     auto offset = program->uniform_buffer_data_offsets.at(block_num);
@@ -34,9 +275,32 @@ void set_uniform_buffer(VKContext &context, MemState &mem, const ShaderProgram *
     }
 
     const uint32_t data_size_upload = std::min<uint32_t>(size, program->uniform_buffer_sizes.at(block_num) * 4);
+    static uint32_t doubledragon_uniform_trace_count = 0;
+    const bool doubledragon_trace = vertex_shader && doubledragon_target_vertex_program(program)
+        && doubledragon_viewport_trace_enabled() && doubledragon_uniform_trace_count < 16;
+    const uint32_t doubledragon_call = doubledragon_trace ? ++doubledragon_uniform_trace_count : 0;
+    const uint8_t *const source_bytes = data.get(mem);
+    static uint32_t nba2k16_crowd_uniform_upload_count = 0;
+    const bool nba2k16_crowd_trace = vertex_shader
+        && !context.state.features.enable_memory_mapping
+        && diagnostics::nba2k16_crowd_uniform_trace_enabled(program->hash.data(), program->hash.size())
+        && nba2k16_crowd_uniform_upload_count < diagnostics::NBA2K16_CROWD_UNIFORM_TRACE_LIMIT;
+    const uint32_t nba2k16_crowd_call = nba2k16_crowd_trace
+        ? ++nba2k16_crowd_uniform_upload_count
+        : 0;
+    const auto source_hashes = nba2k16_crowd_trace
+        ? diagnostics::nba2k16_crowd_uniform_hashes(source_bytes, data_size_upload)
+        : diagnostics::Nba2k16CrowdUniformHashes{};
+    if (doubledragon_trace) {
+        std::fprintf(stderr,
+            "VITA3K_DDRG_TARGET_UB_QUEUE call=%u block=%d guest=0x%08X requested=%d upload=%u float_offset=%u mapped=%u bytes=",
+            doubledragon_call, block_num, data.address(), size, data_size_upload, offset,
+            static_cast<unsigned>(context.state.features.enable_memory_mapping));
+        doubledragon_trace_bytes(source_bytes, std::min<uint32_t>(data_size_upload, 256));
+    }
+
     if (context.state.features.enable_memory_mapping) {
         if (context.state.mapping_method == MappingMethod::DoubleBuffer) {
-            // we must always cover everything as some small part of the buffer may get changed only
             context.state.buffer_trapping.access_buffer(data.address(), data_size_upload, mem, false, true);
         }
 
@@ -46,27 +310,72 @@ void set_uniform_buffer(VKContext &context, MemState &mem, const ShaderProgram *
         } else {
             context.curr_frag_ublock.set_buffer_address(block_num, buffer_address);
         }
+        if (doubledragon_trace) {
+            std::fprintf(stderr,
+                "VITA3K_DDRG_TARGET_UB_DEVICE call=%u block=%d address=0x%016llX\n",
+                doubledragon_call, block_num, static_cast<unsigned long long>(buffer_address));
+        }
     } else {
         const uint32_t offset_start_upload = offset * 4;
 
         if (vertex_shader) {
             if (!context.vertex_uniform_storage_allocated) {
-                // Allocate a region for it. Don't worry though, when the shader program is changed
                 context.vertex_uniform_stream_ring_buffer.allocate(program->max_total_uniform_buffer_storage * 4);
                 context.vertex_uniform_storage_allocated = true;
             }
 
-            context.vertex_uniform_stream_ring_buffer.copy(context.prerender_cmd, data_size_upload, data.get(mem), offset_start_upload);
+            context.vertex_uniform_stream_ring_buffer.copy(context.prerender_cmd, data_size_upload, source_bytes, offset_start_upload);
+            if (nba2k16_crowd_trace) {
+                const uint32_t ring_base = context.vertex_uniform_stream_ring_buffer.data_offset;
+                const uint32_t ring_offset = ring_base + offset_start_upload;
+                const uint32_t expected_bytes = program->uniform_buffer_sizes.at(block_num) * 4u;
+                const uint32_t total_bytes = program->max_total_uniform_buffer_storage * 4u;
+                const uint8_t *const ring_bytes = context.vertex_uniform_stream_ring_buffer.mapped_at(ring_offset);
+                const bool ring_readable = ring_bytes
+                    && uint64_t(ring_offset) + diagnostics::NBA2K16_CROWD_UNIFORM_BYTES
+                        <= context.vertex_uniform_stream_ring_buffer.mapped_size();
+                const auto ring_hashes = ring_readable
+                    ? diagnostics::nba2k16_crowd_uniform_hashes(ring_bytes, diagnostics::NBA2K16_CROWD_UNIFORM_BYTES)
+                    : diagnostics::Nba2k16CrowdUniformHashes{};
+                const bool equal = ring_readable
+                    && data_size_upload >= diagnostics::NBA2K16_CROWD_UNIFORM_BYTES
+                    && std::memcmp(source_bytes, ring_bytes, diagnostics::NBA2K16_CROWD_UNIFORM_BYTES) == 0;
+                std::fprintf(stderr,
+                    "VITA3K_NBA2K16_CROWD_UB_UPLOAD call=%u block=%d guest=0x%08X requested=%d expected=%u upload=%u float_offset=%u total=%u base=%u offset=%u readable=%u equal=%u source=%016llX source_instance=%016llX source_matrix=%016llX ring=%016llX ring_instance=%016llX ring_matrix=%016llX\n",
+                    nba2k16_crowd_call, block_num, data.address(), size, expected_bytes,
+                    data_size_upload, offset, total_bytes, ring_base, ring_offset,
+                    static_cast<unsigned>(ring_readable), static_cast<unsigned>(equal),
+                    static_cast<unsigned long long>(source_hashes.full),
+                    static_cast<unsigned long long>(source_hashes.instance),
+                    static_cast<unsigned long long>(source_hashes.matrix),
+                    static_cast<unsigned long long>(ring_hashes.full),
+                    static_cast<unsigned long long>(ring_hashes.instance),
+                    static_cast<unsigned long long>(ring_hashes.matrix));
+                std::fflush(stderr);
+            }
+            if (doubledragon_trace) {
+                const uint32_t ring_offset = context.vertex_uniform_stream_ring_buffer.data_offset + offset_start_upload;
+                const uint8_t *const ring_bytes = context.vertex_uniform_stream_ring_buffer.mapped_at(ring_offset);
+                const bool readable = ring_bytes
+                    && uint64_t(ring_offset) + data_size_upload <= context.vertex_uniform_stream_ring_buffer.mapped_size();
+                std::fprintf(stderr,
+                    "VITA3K_DDRG_TARGET_UB_RING call=%u block=%d base=%u offset=%u readable=%u bytes=",
+                    doubledragon_call, block_num, context.vertex_uniform_stream_ring_buffer.data_offset,
+                    ring_offset, static_cast<unsigned>(readable));
+                doubledragon_trace_bytes(readable ? ring_bytes : nullptr,
+                    readable ? std::min<uint32_t>(data_size_upload, 256) : 0);
+            }
         } else {
             if (!context.fragment_uniform_storage_allocated) {
-                // Allocate a region for it. Don't worry though, when the shader program is changed
                 context.fragment_uniform_stream_ring_buffer.allocate(program->max_total_uniform_buffer_storage * 4);
                 context.fragment_uniform_storage_allocated = true;
             }
 
-            context.fragment_uniform_stream_ring_buffer.copy(context.prerender_cmd, data_size_upload, data.get(mem), offset_start_upload);
+            context.fragment_uniform_stream_ring_buffer.copy(context.prerender_cmd, data_size_upload, source_bytes, offset_start_upload);
         }
     }
+    if (doubledragon_trace)
+        std::fflush(stderr);
 }
 
 void mid_scene_flush(VKContext &context, const SceGxmNotification notification) {
@@ -249,20 +558,84 @@ static void draw_bind_descriptors(VKContext &context, MemState &mem) {
         descriptors.size(), descriptors.data(), dynamic_offset_count, dynamic_offsets);
 }
 
+static int active_vertex_stream_count(const VKContext &context, const MemState &mem) {
+    const SceGxmVertexProgram &vertex_program = *context.record.vertex_program.get(mem);
+    const VertexProgram *vkvert = vertex_program.renderer_data.get();
+    int max_stream_idx = -1;
+    for (const SceGxmVertexAttribute &attribute : vertex_program.attributes) {
+        if (vkvert->attribute_infos.contains(attribute.regIndex))
+            max_stream_idx = std::max<int>(max_stream_idx, attribute.streamIndex);
+    }
+    return max_stream_idx + 1;
+}
+
+static uint32_t vertex_stream_upload_bytes(const VKContext &context, const MemState &mem) {
+    const SceGxmVertexProgram &vertex_program = *context.record.vertex_program.get(mem);
+    const int stream_count = active_vertex_stream_count(context, mem);
+    uint64_t total = 0;
+    for (int i = 0; i < stream_count; ++i) {
+        if (!context.record.vertex_streams[i].data)
+            continue;
+        uint32_t stream_size = context.record.vertex_streams[i].size;
+#ifdef __APPLE__
+        const uint32_t stride = vertex_program.streams[i].stride;
+        if (stride % 4 != 0) {
+            const uint32_t new_stride = align(stride, 4);
+            const uint32_t vertex_count = (stream_size + stride - 1) / stride;
+            stream_size = vertex_count * new_stride;
+        }
+#endif
+        total += align(stream_size, context.vertex_stream_ring_buffer.alignment);
+    }
+    return static_cast<uint32_t>(std::min<uint64_t>(total, std::numeric_limits<uint32_t>::max()));
+}
+
+static void synchronize_stream_ring_wraps(VKContext &context, uint32_t vertex_bytes, uint32_t index_bytes) {
+    if (!diagnostics::stream_ring_wrap_sync_enabled())
+        return;
+
+    const bool vertex_wrap = vertex_bytes != 0 && context.vertex_stream_ring_buffer.will_wrap(vertex_bytes);
+    const bool index_wrap = index_bytes != 0 && context.index_stream_ring_buffer.will_wrap(index_bytes);
+    if (!vertex_wrap && !index_wrap)
+        return;
+
+    const bool was_recording = context.is_recording;
+    if (was_recording) {
+        SceGxmNotification empty_notification{};
+        context.stop_recording(empty_notification, empty_notification, true);
+    }
+    context.state.device.waitIdle();
+
+    static uint32_t trace_count = 0;
+    if (trace_count < 128u) {
+        if (vertex_wrap) {
+            std::fprintf(stderr,
+                "VITA3K_STREAM_RING_WRAP_SYNC kind=vertex frame=%llu cursor=%u size=%u capacity=%u\n",
+                static_cast<unsigned long long>(context.frame_timestamp),
+                context.vertex_stream_ring_buffer.used_bytes(), vertex_bytes,
+                context.vertex_stream_ring_buffer.capacity_bytes());
+            ++trace_count;
+        }
+        if (index_wrap && trace_count < 128u) {
+            std::fprintf(stderr,
+                "VITA3K_STREAM_RING_WRAP_SYNC kind=index frame=%llu cursor=%u size=%u capacity=%u\n",
+                static_cast<unsigned long long>(context.frame_timestamp),
+                context.index_stream_ring_buffer.used_bytes(), index_bytes,
+                context.index_stream_ring_buffer.capacity_bytes());
+            ++trace_count;
+        }
+        std::fflush(stderr);
+    }
+
+    if (was_recording)
+        context.start_recording();
+}
+
 // vertex count is only used with double buffer mapping
 static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t instance_count, uint32_t max_index) {
     GxmRecordState &state = context.record;
     const SceGxmVertexProgram &vertex_program = *state.vertex_program.get(mem);
-    VertexProgram *vkvert = vertex_program.renderer_data.get();
-
-    int max_stream_idx = -1;
-
-    for (const SceGxmVertexAttribute &attribute : vertex_program.attributes) {
-        if (!vkvert->attribute_infos.contains(attribute.regIndex))
-            continue;
-        max_stream_idx = std::max<int>(max_stream_idx, attribute.streamIndex);
-    }
-    max_stream_idx++;
+    const int max_stream_idx = active_vertex_stream_count(context, mem);
 
     if (context.state.mapping_method == MappingMethod::DoubleBuffer) {
         for (int i = 0; i < max_stream_idx; i++)
@@ -326,7 +699,42 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
 
 void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format,
     Ptr<void> indices, size_t count, uint32_t instance_count, MemState &mem, const Config &config) {
+    const auto &mg2_vertex_renderer = context.record.vertex_program.get(mem)->renderer_data;
+    const auto &mg2_fragment_renderer = context.record.fragment_program.get(mem)->renderer_data;
+    static uint32_t mg2_clear_trace_count = 0;
+    const bool mg2_clear_trace = minigore_clear_trace_enabled()
+        && minigore_clear_hash_pair(mg2_vertex_renderer.get(), mg2_fragment_renderer.get())
+        && mg2_clear_trace_count < 64;
+    const uint32_t mg2_clear_call = mg2_clear_trace ? ++mg2_clear_trace_count : 0;
+    const SceGxmFragmentProgram &gxm_fragment_program = *context.record.fragment_program.get(mem);
+    if (mg2_clear_trace) {
+        std::fprintf(stderr,
+            "VITA3K_MG2_CLEAR_ENTRY call=%u count=%zu instances=%u primitive=%u format=%u indices=0x%08X maskupdate=%u use_mask=%u refresh=%u pipeline=%p renderpass=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u\n",
+            mg2_clear_call, count, instance_count, uint32_t(type), uint32_t(format), indices.address(),
+            unsigned(gxm_fragment_program.is_maskupdate), unsigned(context.state.features.use_mask_bit),
+            unsigned(context.refresh_pipeline), VkPipeline(context.current_pipeline), unsigned(context.in_renderpass),
+            context.viewport.x, context.viewport.y, context.viewport.width, context.viewport.height,
+            context.scissor.offset.x, context.scissor.offset.y,
+            context.scissor.extent.width, context.scissor.extent.height);
+        std::fflush(stderr);
+    }
+    if (!context.state.features.use_mask_bit && gxm_fragment_program.is_maskupdate) {
+        if (mg2_clear_trace) {
+            std::fprintf(stderr, "VITA3K_MG2_CLEAR_GATE call=%u gate=maskupdate\n", mg2_clear_call);
+            std::fflush(stderr);
+        }
+        return;
+    }
+
     void *indices_ptr = indices.get(mem);
+    const bool use_memory_mapping = context.state.features.enable_memory_mapping;
+    const size_t index_size = (format == SCE_GXM_INDEX_FORMAT_U16) ? 2 : 4;
+    const size_t index_buffer_size = index_size * count;
+    if (!use_memory_mapping) {
+        synchronize_stream_ring_wraps(context,
+            vertex_stream_upload_bytes(context, mem),
+            static_cast<uint32_t>(index_buffer_size));
+    }
 
     context.check_for_macroblock_change(true);
 
@@ -341,7 +749,6 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         context.is_first_scene_draw = false;
     }
 
-    const SceGxmFragmentProgram &gxm_fragment_program = *context.record.fragment_program.get(mem);
     const SceGxmProgram &fragment_program_gxp = *gxm_fragment_program.program.get(mem);
     if (context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used()) {
         // the fragment shader is using programmable blending with a subpass input
@@ -398,6 +805,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         bool can_be_whole_quad = instance_count == 1 && count <= 6;
         vk::Pipeline new_pipeline = context.state.pipeline_cache.retrieve_pipeline(context, type, !can_be_whole_quad, mem);
 
+        if (mg2_clear_trace) {
+            std::fprintf(stderr,
+                "VITA3K_MG2_CLEAR_PIPELINE call=%u new=%p old=%p whole_quad=%u\n",
+                mg2_clear_call, VkPipeline(new_pipeline), VkPipeline(context.current_pipeline),
+                unsigned(can_be_whole_quad));
+            std::fflush(stderr);
+        }
+
         if (new_pipeline != context.current_pipeline) {
             context.current_pipeline = new_pipeline;
 
@@ -407,19 +822,27 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     }
 
     // can happen with asynchronous pipeline compilation
-    if (context.current_pipeline == nullptr)
+    if (context.current_pipeline == nullptr) {
+        if (mg2_clear_trace) {
+            std::fprintf(stderr, "VITA3K_MG2_CLEAR_GATE call=%u gate=no_pipeline\n", mg2_clear_call);
+            std::fflush(stderr);
+        }
         return;
-
-    if (config.log_active_shaders) {
-        const std::string hash_text_f = hex_string(context.record.fragment_program.get(mem)->renderer_data->hash);
-        const std::string hash_text_v = hex_string(context.record.vertex_program.get(mem)->renderer_data->hash);
-
-        LOG_DEBUG("\nVertex  : {}\nFragment: {}", hash_text_v, hash_text_f);
-        LOG_DEBUG("Vertex default uniform buffer: {}\n", spdlog::to_hex(context.ubo_data[0], 16));
-        LOG_DEBUG("Fragment default uniform buffer: {}\n", spdlog::to_hex(context.ubo_data[SCE_GXM_REAL_MAX_UNIFORM_BUFFER], 16));
     }
 
-    const bool use_memory_mapping = context.state.features.enable_memory_mapping;
+    if (config.run_app_path && *config.run_app_path == "ACXI00001"
+        && (context.viewport.width == 0.0f || context.viewport.height == 0.0f)) {
+        context.viewport = vk::Viewport{
+            .x = 0.0f,
+            .y = 0.0f,
+            .width = static_cast<float>(context.render_target->width),
+            .height = static_cast<float>(context.render_target->height),
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f
+        };
+        context.render_cmd.setViewport(0, context.viewport);
+        LOG_WARN_ONCE("Ace Combat Xi did not initialize the GXM viewport; using the full render target for rasterization");
+    }
 
     // update uniforms if needed
     // first update the buffer and texture count
@@ -439,10 +862,46 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     auto &vert_ublock = context.curr_vert_ublock.base_block;
     vert_ublock.viewport_flip = context.record.viewport_flip;
     vert_ublock.viewport_flag = (context.record.viewport_flat) ? 0.0f : 1.0f;
+    const char *const gl_clip_compat_env = std::getenv("VITA3K_ACXI_GL_CLIP_COMPAT");
+    const char *const force_clip_reject_env = std::getenv("VITA3K_ACXI_FORCE_CLIP_REJECT");
+    const bool gl_clip_compat = config.run_app_path && *config.run_app_path == "ACXI00001"
+        && gl_clip_compat_env && gl_clip_compat_env[0] == '1' && gl_clip_compat_env[1] == 0;
+    const bool force_clip_reject = config.run_app_path && *config.run_app_path == "ACXI00001"
+        && force_clip_reject_env && force_clip_reject_env[0] == '1' && force_clip_reject_env[1] == 0;
+    const int force_clip_plane = acxi_force_clip_plane(config, vert_render_data->hash);
+    vert_ublock.w_clamp_enabled = gl_clip_compat ? 0.0f : context.record.w_clamp_enabled ? 1.0f : 0.0f;
+    vert_ublock.w_clamp_value = context.record.w_clamp_value;
+    vert_ublock.post_viewport_clip = force_clip_reject ? 2.0f
+        : force_clip_plane >= 0 ? 3.0f + static_cast<float>(force_clip_plane)
+                                : gl_clip_compat ? 1.0f : 0.0f;
     vert_ublock.z_offset = context.record.z_offset;
     vert_ublock.z_scale = context.record.z_scale;
     vert_ublock.screen_width = context.render_target->width / context.state.res_multiplier;
     vert_ublock.screen_height = context.render_target->height / context.state.res_multiplier;
+
+    static uint32_t doubledragon_draw_state_trace_count = 0;
+    const char *const doubledragon_viewport_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    if (doubledragon_viewport_trace && doubledragon_viewport_trace[0] == '1'
+        && doubledragon_viewport_trace[1] == 0
+        && doubledragon_draw_state_trace_count < 256) {
+        uint64_t vertex_hash_prefix = 0;
+        std::memcpy(&vertex_hash_prefix, vert_render_data->hash.data(), sizeof(vertex_hash_prefix));
+        std::fprintf(stderr,
+            "VITA3K_DDRG_DRAW_STATE call=%u count=%zu instances=%u viewport=%g,%g,%g,%g,%g,%g scissor=%d,%d,%u,%u flat=%u flip=%g,%g,%g,%g z=%g,%g screen=%g,%g target=%ux%u vertex_hash=%016llX\n",
+            ++doubledragon_draw_state_trace_count, count, instance_count,
+            context.viewport.x, context.viewport.y, context.viewport.width, context.viewport.height,
+            context.viewport.minDepth, context.viewport.maxDepth,
+            context.scissor.offset.x, context.scissor.offset.y,
+            context.scissor.extent.width, context.scissor.extent.height,
+            static_cast<unsigned>(context.record.viewport_flat),
+            context.record.viewport_flip[0], context.record.viewport_flip[1],
+            context.record.viewport_flip[2], context.record.viewport_flip[3],
+            context.record.z_offset, context.record.z_scale,
+            vert_ublock.screen_width, vert_ublock.screen_height,
+            context.render_target->width, context.render_target->height,
+            static_cast<unsigned long long>(vertex_hash_prefix));
+        std::fflush(stderr);
+    }
 
     if (context.curr_vert_ublock.changed || memcmp(&context.prev_vert_ublock, &vert_ublock, sizeof(vert_ublock)) != 0) {
         // TODO: this intermediate step can be avoided
@@ -469,12 +928,85 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     }
 
     // create, update and bind descriptors (uniforms and textures)
+    const uint16_t fragment_texture_count =
+        context.record.fragment_program.get(mem)->renderer_data->texture_count;
+    const bool bloonstd5hd_retry_draw =
+        bloonstd5hd_retry_first_textured_draw()
+        && context.last_frag_texture_count == 0
+        && fragment_texture_count > 0
+        && count == 6
+        && instance_count == 1;
     draw_bind_descriptors(context, mem);
+    static uint32_t nba2k16_crowd_uniform_draw_count = 0;
+    const bool nba2k16_crowd_draw_trace = !use_memory_mapping
+        && diagnostics::nba2k16_crowd_uniform_trace_enabled(
+            vert_render_data->hash.data(), vert_render_data->hash.size())
+        && nba2k16_crowd_uniform_draw_count < diagnostics::NBA2K16_CROWD_UNIFORM_TRACE_LIMIT;
+    if (nba2k16_crowd_draw_trace) {
+        const uint32_t trace_call = ++nba2k16_crowd_uniform_draw_count;
+        const uint32_t ring_base = context.vertex_uniform_stream_ring_buffer.data_offset;
+        const uint32_t total_bytes = vert_render_data->max_total_uniform_buffer_storage * 4u;
+        const uint8_t *const ring_bytes = context.vertex_uniform_stream_ring_buffer.mapped_at(ring_base);
+        const bool ring_readable = ring_bytes
+            && total_bytes >= diagnostics::NBA2K16_CROWD_UNIFORM_BYTES
+            && uint64_t(ring_base) + diagnostics::NBA2K16_CROWD_UNIFORM_BYTES
+                <= context.vertex_uniform_stream_ring_buffer.mapped_size();
+        const auto ring_hashes = ring_readable
+            ? diagnostics::nba2k16_crowd_uniform_hashes(ring_bytes, diagnostics::NBA2K16_CROWD_UNIFORM_BYTES)
+            : diagnostics::Nba2k16CrowdUniformHashes{};
+        std::fprintf(stderr,
+            "VITA3K_NBA2K16_CROWD_UB_DRAW call=%u frame=%llu scene=%llu count=%zu instances=%u base=%u total=%u readable=%u ring=%016llX ring_instance=%016llX ring_matrix=%016llX\n",
+            trace_call, static_cast<unsigned long long>(context.frame_timestamp),
+            static_cast<unsigned long long>(context.scene_timestamp), count, instance_count,
+            ring_base, total_bytes, static_cast<unsigned>(ring_readable),
+            static_cast<unsigned long long>(ring_hashes.full),
+            static_cast<unsigned long long>(ring_hashes.instance),
+            static_cast<unsigned long long>(ring_hashes.matrix));
+        std::fflush(stderr);
+    }
+    if (mg2_clear_trace) {
+        const size_t vertex_bytes_count = std::min<size_t>(mg2_vertex_renderer->max_total_uniform_buffer_storage * 4u, 64u);
+        const size_t fragment_bytes_count = std::min<size_t>(mg2_fragment_renderer->max_total_uniform_buffer_storage * 4u, 64u);
+        const uint32_t vertex_offset = context.vertex_uniform_stream_ring_buffer.data_offset;
+        const uint32_t fragment_offset = context.fragment_uniform_stream_ring_buffer.data_offset;
+        const uint8_t *const vertex_bytes = vertex_bytes_count
+            ? context.vertex_uniform_stream_ring_buffer.mapped_at(vertex_offset)
+            : nullptr;
+        const uint8_t *const fragment_bytes = fragment_bytes_count
+            ? context.fragment_uniform_stream_ring_buffer.mapped_at(fragment_offset)
+            : nullptr;
+        const bool vertex_readable = vertex_bytes
+            && uint64_t(vertex_offset) + vertex_bytes_count <= context.vertex_uniform_stream_ring_buffer.mapped_size();
+        const bool fragment_readable = fragment_bytes
+            && uint64_t(fragment_offset) + fragment_bytes_count <= context.fragment_uniform_stream_ring_buffer.mapped_size();
+        std::fprintf(stderr,
+            "VITA3K_MG2_CLEAR_DESCRIPTORS call=%u pipeline=%p mapped=%u offsets=%u,%u,%u,%u allocated=%u,%u uniform_sizes=%u,%u readable=%u,%u vertex=",
+            mg2_clear_call, VkPipeline(context.current_pipeline), unsigned(use_memory_mapping),
+            context.vertex_info_uniform_buffer.data_offset,
+            context.fragment_info_uniform_buffer.data_offset,
+            vertex_offset, fragment_offset,
+            unsigned(context.vertex_uniform_storage_allocated), unsigned(context.fragment_uniform_storage_allocated),
+            unsigned(mg2_vertex_renderer->max_total_uniform_buffer_storage * 4u),
+            unsigned(mg2_fragment_renderer->max_total_uniform_buffer_storage * 4u),
+            unsigned(vertex_readable), unsigned(fragment_readable));
+        minigore_clear_trace_bytes(vertex_readable ? vertex_bytes : nullptr, vertex_readable ? vertex_bytes_count : 0);
+        std::fprintf(stderr, "VITA3K_MG2_CLEAR_FRAGMENT call=%u bytes=", mg2_clear_call);
+        minigore_clear_trace_bytes(fragment_readable ? fragment_bytes : nullptr, fragment_readable ? fragment_bytes_count : 0);
+        std::fflush(stderr);
+    }
+
+    const bool bounded_probe = capture_bios_draw(context, type, format, indices, count, instance_count, mem, config);
+    if (config.log_active_shaders && !bounded_probe) {
+        const std::string hash_text_f = hex_string(context.record.fragment_program.get(mem)->renderer_data->hash);
+        const std::string hash_text_v = hex_string(context.record.vertex_program.get(mem)->renderer_data->hash);
+
+        LOG_DEBUG("\nVertex  : {}\nFragment: {}", hash_text_v, hash_text_f);
+        LOG_DEBUG("Vertex default uniform buffer: {}\n", spdlog::to_hex(context.ubo_data[0], 16));
+        LOG_DEBUG("Fragment default uniform buffer: {}\n", spdlog::to_hex(context.ubo_data[SCE_GXM_REAL_MAX_UNIFORM_BUFFER], 16));
+    }
 
     // Upload index data.
     vk::IndexType index_type = (format == SCE_GXM_INDEX_FORMAT_U16) ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-    const size_t index_size = (format == SCE_GXM_INDEX_FORMAT_U16) ? 2 : 4;
-
     uint32_t max_index = 0;
     if (use_memory_mapping) {
         auto [buffer, offset] = context.state.get_matching_mapping(indices);
@@ -494,7 +1026,6 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         }
         context.render_cmd.bindIndexBuffer(buffer, offset, index_type);
     } else {
-        const size_t index_buffer_size = index_size * count;
         context.index_stream_ring_buffer.allocate(context.prerender_cmd, index_buffer_size, indices_ptr);
         context.render_cmd.bindIndexBuffer(context.index_stream_ring_buffer.handle(), context.index_stream_ring_buffer.data_offset, index_type);
     }
@@ -502,7 +1033,38 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     // bind the vertex streams
     bind_vertex_streams(context, mem, instance_count, max_index);
 
-    context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
+    const bool acxi_skip_hangar_environment =
+        acxi_skip_hangar_environment_draw(context, mem, config);
+    const bool nba2k16_skip_draw =
+        nba2k16_skip_draw_range(context, mem, config, type, count, instance_count);
+    const char *const sixty_composite_trace_env = std::getenv("VITA3K_SIXTY_COMPOSITE_TRACE");
+    const bool sixty_composite_trace = sixty_composite_trace_env
+        && sixty_composite_trace_env[0] == '1' && sixty_composite_trace_env[1] == 0
+        && hex_string(mg2_vertex_renderer->hash) == "1ed37f037294fd954438847fc53eb4eaa1602747c5f5e0262e68a210082f6353"
+        && hex_string(mg2_fragment_renderer->hash) == "eca96fb5d9b62e549a89a583e7c738f1194db271ae81e919deec8845623e220b";
+    if (sixty_composite_trace) {
+        std::fprintf(stderr,
+            "VITA3K_SIXTY_COMPOSITE_SUBMIT frame=%llu scene=%llu count=%zu instances=%u pipeline=%p framebuffer=%p color_view=%p color_data=0x%08X stride=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u\n",
+            static_cast<unsigned long long>(context.frame_timestamp),
+            static_cast<unsigned long long>(context.scene_timestamp), count, instance_count,
+            static_cast<void *>(VkPipeline(context.current_pipeline)),
+            static_cast<void *>(VkFramebuffer(context.current_framebuffer)),
+            static_cast<void *>(VkImageView(context.current_color_view)),
+            context.record.color_surface.data.address(), context.record.color_surface.strideInPixels,
+            context.viewport.x, context.viewport.y, context.viewport.width, context.viewport.height,
+            context.scissor.offset.x, context.scissor.offset.y,
+            context.scissor.extent.width, context.scissor.extent.height);
+        std::fflush(stderr);
+    }
+    if (!acxi_skip_hangar_environment && !nba2k16_skip_draw)
+        context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
+    if (mg2_clear_trace) {
+        std::fprintf(stderr, "VITA3K_MG2_CLEAR_SUBMIT call=%u count=%zu instances=%u\n",
+            mg2_clear_call, count, instance_count);
+        std::fflush(stderr);
+    }
+    if (bloonstd5hd_retry_draw)
+        context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
 
     context.vertex_uniform_storage_allocated = false;
     context.fragment_uniform_storage_allocated = false;

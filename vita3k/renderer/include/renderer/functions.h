@@ -83,8 +83,8 @@ void set_stencil_ref(State &state, Context *ctx, bool is_front, unsigned char sr
 void set_program(State &state, Context *ctx, Ptr<const void> program, const bool is_fragment);
 void set_cull_mode(State &state, Context *ctx, SceGxmCullMode cull);
 void set_texture(State &state, Context *ctx, const std::uint32_t tex_index, const SceGxmTexture tex);
-void set_viewport_real(State &state, Context *ctx, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale);
-void set_viewport_flat(State &state, Context *ctx);
+void set_viewport_real(State &state, Context *ctx, bool wClampEnabled, float wClampValue, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale);
+void set_viewport_flat(State &state, Context *ctx, bool wClampEnabled, float wClampValue);
 void set_region_clip(State &state, Context *ctx, SceGxmRegionClipMode mode, unsigned int xMin, unsigned int xMax, unsigned int yMin, unsigned int yMax);
 void set_two_sided_enable(State &state, Context *ctx, SceGxmTwoSidedMode mode);
 void set_side_fragment_program_enable(State &state, Context *ctx, const bool is_front, SceGxmFragmentProgramMode mode);

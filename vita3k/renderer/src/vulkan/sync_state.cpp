@@ -24,6 +24,9 @@
 
 #include <util/log.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace renderer::vulkan {
 
 void sync_clipping(VKContext &context) {
@@ -196,6 +199,23 @@ void sync_viewport_real(VKContext &context, const float xOffset, const float yOf
         .minDepth = 0.0f,
         .maxDepth = 1.0f
     };
+
+    static uint32_t doubledragon_vk_viewport_trace_count = 0;
+    const char *const doubledragon_viewport_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    if (doubledragon_viewport_trace && doubledragon_viewport_trace[0] == '1'
+        && doubledragon_viewport_trace[1] == 0
+        && doubledragon_vk_viewport_trace_count < 64) {
+        std::fprintf(stderr,
+            "VITA3K_DDRG_VK_VIEWPORT call=%u input=%g,%g,%g,%g,%g,%g output=%g,%g,%g,%g,%g,%g target=%ux%u res=%g recording=%u\n",
+            ++doubledragon_vk_viewport_trace_count,
+            xOffset, yOffset, zOffset, xScale, yScale, zScale,
+            context.viewport.x, context.viewport.y, context.viewport.width, context.viewport.height,
+            context.viewport.minDepth, context.viewport.maxDepth,
+            context.render_target ? context.render_target->width : 0,
+            context.render_target ? context.render_target->height : 0,
+            res_multiplier, static_cast<unsigned>(context.is_recording));
+        std::fflush(stderr);
+    }
 
     if (!context.is_recording)
         return;

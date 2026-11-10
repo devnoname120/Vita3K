@@ -22,6 +22,8 @@
 #include "vkutil/vkutil.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 
 #ifdef _WIN32
@@ -60,6 +62,16 @@ bool window_has_drawable_size(const VKState &state) {
     const auto *frame_host = static_cast<const renderer::State &>(state).frame;
     return frame_host->drawable_width() > 0 && frame_host->drawable_height() > 0;
 }
+
+bool force_green_screen() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("VITA3K_SCREEN_FORCE_GREEN");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+}
+
+std::atomic<uint32_t> force_green_screen_logs{ 0 };
 
 } // namespace
 
@@ -485,6 +497,28 @@ void ScreenRenderer::begin_default_render_pass() {
 void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport) {
     if (swapchain_image_idx == ~0 && !acquire_swapchain_image())
         return;
+
+    if (force_green_screen()) {
+        vk::RenderPassBeginInfo pass_info{
+            .renderPass = default_render_pass,
+            .framebuffer = swapchain_framebuffers[swapchain_image_idx],
+            .renderArea = {
+                .offset = { 0, 0 },
+                .extent = extent }
+        };
+        vk::ClearValue clear_color{
+            .color = { std::array<float, 4>{ 0.0f, 1.0f, 0.0f, 1.0f } }
+        };
+        pass_info.setClearValues(clear_color);
+        current_cmd_buffer.beginRenderPass(pass_info, vk::SubpassContents::eInline);
+        const uint32_t log_index = force_green_screen_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 16) {
+            std::fprintf(stderr,
+                "VITA3K_SCREEN_FORCE_GREEN call=%u image=%u extent=%ux%u\n",
+                log_index + 1, swapchain_image_idx, extent.width, extent.height);
+        }
+        return;
+    }
 
     // we need to apply the screen filter at the right moment (before or after we start the render pass depending on it)
     filter->render(true, image_view, layout, viewport);

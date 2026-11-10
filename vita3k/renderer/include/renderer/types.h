@@ -139,6 +139,8 @@ struct GxmRecordState {
     std::array<float, 4> viewport_flip = { 1.0f, 1.0f, 1.0f, 1.0f };
     float z_offset = 0.5f;
     float z_scale = 0.5f;
+    bool w_clamp_enabled = true;
+    float w_clamp_value = 0.00001f;
 
     GxmStencilStateValues front_stencil_state_values;
     GxmStencilStateValues back_stencil_state_values;
