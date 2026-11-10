@@ -128,32 +128,9 @@ inline bool capture_bios_draw(VKContext &context, SceGxmPrimitiveType type,
             vertex_program->renderer_data->hash.data(),
             vertex_program->renderer_data->hash.size());
     const bool nba2k16_full_crowd = nba2k16_high_crowd || nba2k16_low_crowd || nba2k16_player;
-    const bool legacy_title = config.run_app_path
-        && (*config.run_app_path == "BIOS00001" || *config.run_app_path == "ACXI00001"
-            || *config.run_app_path == "ASPHALT07" || *config.run_app_path == "DDRG00001"
-            || *config.run_app_path == "MINIGORE2" || *config.run_app_path == "SIXT00001");
-    if (!probe.enabled() || !config.run_app_path || (!legacy_title && !nba2k16_full_crowd))
+    // The probe is opt-in (VITA3K_BIOS_DRAW_PROBE_DIR plus a request file), so it serves every title.
+    if (!probe.enabled() || !config.run_app_path)
         return false;
-    static uint64_t doubledragon_target_frame = std::numeric_limits<uint64_t>::max();
-    const bool doubledragon = *config.run_app_path == "DDRG00001";
-    const bool acecombatxi = *config.run_app_path == "ACXI00001";
-    if (doubledragon && doubledragon_target_frame == std::numeric_limits<uint64_t>::max()) {
-        static constexpr uint8_t target_hash_prefix[] = { 0x2e, 0x41, 0xa6, 0x5f, 0xc8, 0x67, 0xfd, 0xc7 };
-        const auto *const vertex = context.record.vertex_program.get(mem);
-        if (!vertex || std::memcmp(vertex->renderer_data->hash.data(), target_hash_prefix, sizeof(target_hash_prefix)) != 0)
-            return false;
-        const auto &stream = context.record.vertex_streams[0];
-        if (!stream.data || stream.size < 48 || !probe_readable(mem, stream.data.address(), 48))
-            return false;
-        const float *const values = stream.data.cast<const float>().get(mem);
-        if (!values
-            || values[0] != 0.0f || values[1] != 0.0f || values[2] != -80.0f
-            || values[3] != 0.0f || values[4] != -320.0f || values[5] != -80.0f
-            || values[6] != 480.0f || values[7] != -320.0f || values[8] != -80.0f
-            || values[9] != 480.0f || values[10] != 0.0f || values[11] != -80.0f)
-            return false;
-        doubledragon_target_frame = context.frame_timestamp;
-    }
     const auto result = probe.visit(context.frame_timestamp, [&](std::ostream &out, unsigned ordinal) {
         const auto &record = context.record;
         const auto &vertex = *record.vertex_program.get(mem);
@@ -364,8 +341,6 @@ inline bool capture_bios_draw(VKContext &context, SceGxmPrimitiveType type,
         }
     });
     if (result == diagnostics::BoundedDrawProbe::Result::completed) {
-        if (doubledragon)
-            doubledragon_target_frame = std::numeric_limits<uint64_t>::max();
         LOG_INFO("BIOS_DRAW_PROBE completed in VITA3K_BIOS_DRAW_PROBE_DIR");
     }
     else if (result == diagnostics::BoundedDrawProbe::Result::failed)
