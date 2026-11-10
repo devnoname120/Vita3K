@@ -32,6 +32,7 @@ TRACY_MODULE_NAME(taiHEN);
 // substitute library for instruction relocation (from comex/substitute, LGPLv2.1+)
 #include <substitute_api.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -1335,14 +1336,42 @@ static void register_hle_override(EmuEnvState &emuenv, uint32_t nid) {
     LOG_INFO("taiHEN: registered HLE override for NID {} ({}) at {}", log_hex(nid), name, log_hex(stub_addr));
 }
 
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+static bool is_ttbr_remap_hle_nid(uint32_t nid) {
+    switch (nid) {
+    case 0xA2BC0C64:
+    case 0x3C40DD70:
+    case 0x50CBA595:
+    case 0x65B7A1A6:
+    case 0xB555C0AC:
+    case 0x8D2C0DE2:
+    case 0x3EDF3E1E:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool ttbr_remap_hle_enabled_for_title(const std::string &titleid) {
+    const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    return requested_title && *requested_title && titleid == requested_title;
+}
+#endif
+
 // Apply HLE overrides for plugin exports that have HLE implementations.
 // When a plugin (e.g. kubridge) exports functions that can't run as LLE
 // (firmware-specific offsets, ARM MMU manipulation), we register them in
 // nids.inc and this function dynamically overrides the LLE exports with
 // SVC stubs that dispatch to our C++ implementations.
-static void apply_plugin_hle_overrides(EmuEnvState &emuenv, const std::set<uint32_t> &pre_plugin_nids) {
+static void apply_plugin_hle_overrides(EmuEnvState &emuenv, const std::set<uint32_t> &pre_plugin_nids,
+    const std::string &titleid) {
     auto &kernel = emuenv.kernel;
     int count = 0;
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    const bool ttbr_remap_hle_enabled = ttbr_remap_hle_enabled_for_title(titleid);
+    if (ttbr_remap_hle_enabled)
+        LOG_INFO("taiHEN: ttbr_remap HLE enabled for {}", titleid);
+#endif
 
     // Snapshot current export_nids to iterate (we'll modify it)
     std::vector<std::pair<uint32_t, Address>> exports_snapshot;
@@ -1365,6 +1394,10 @@ static void apply_plugin_hle_overrides(EmuEnvState &emuenv, const std::set<uint3
             continue;
         }
         if (has_hle_implementation(nid)) {
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+            if (is_ttbr_remap_hle_nid(nid) && !ttbr_remap_hle_enabled)
+                continue;
+#endif
             register_hle_override(emuenv, nid);
             count++;
         }
@@ -1407,7 +1440,7 @@ void load_taihen_plugins_for_title(EmuEnvState &emuenv, const std::string &title
         state->kernel_plugins_loaded = true;
 
         // Apply HLE overrides for plugin exports that have C++ implementations
-        apply_plugin_hle_overrides(emuenv, pre_plugin_nids);
+        apply_plugin_hle_overrides(emuenv, pre_plugin_nids, titleid);
     }
 
     // Load title-specific plugins

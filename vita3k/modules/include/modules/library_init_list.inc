@@ -20,3 +20,7 @@ LIBRARY(SceFiber)
 LIBRARY(taihen)
 LIBRARY(SceSharedFb)
 LIBRARY(SceSysmem)
+
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+LIBRARY(ttbr_remap)
+#endif

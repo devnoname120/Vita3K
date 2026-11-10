@@ -39,14 +39,20 @@ uint32_t read_sp(CPUState &state);
 uint32_t read_pc(CPUState &state);
 uint32_t read_lr(CPUState &state);
 uint32_t read_tpidruro(CPUState &state);
+uint32_t read_tpidrurw(CPUState &state);
 void write_reg(CPUState &state, size_t index, uint32_t value);
 void write_sp(CPUState &state, uint32_t value);
 void write_pc(CPUState &state, uint32_t value);
 void write_lr(CPUState &state, uint32_t value);
 void write_tpidruro(CPUState &state, uint32_t value);
+void write_tpidrurw(CPUState &state, uint32_t value);
 bool is_thumb_mode(CPUState &state);
 CPUContext save_context(CPUState &state);
 void load_context(CPUState &state, const CPUContext &ctx);
+CPUContextRunResult run_context_until_trap(CPUState &state, const CPUContext &context,
+    uint32_t tpidruro, uint32_t tpidrurw);
+CPUContextRunResult run_context_until_trap(CPUState &state, const CPUContext &context,
+    uint32_t tpidruro, uint32_t tpidrurw, uint64_t tick_budget);
 std::size_t get_processor_id(CPUState &state);
 void invalidate_jit_cache(CPUState &state, Address start, size_t length);
 

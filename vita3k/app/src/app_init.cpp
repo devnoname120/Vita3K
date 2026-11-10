@@ -75,6 +75,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 
 namespace app {
@@ -562,7 +563,15 @@ bool late_init(EmuEnvState &state) {
     // the renderer is not using it yet, just storing it for later uses
     state.renderer->late_init(state.cfg, state.app_path, state.mem);
 
-    const bool need_page_table = state.renderer->mapping_method == MappingMethod::PageTable || state.renderer->mapping_method == MappingMethod::NativeBuffer;
+    bool need_page_table = state.renderer->mapping_method == MappingMethod::PageTable || state.renderer->mapping_method == MappingMethod::NativeBuffer;
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    const char *const ttbr_hle_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    if (ttbr_hle_title && *ttbr_hle_title && state.io.title_id == ttbr_hle_title) {
+        // Guest aliases require page-table translation even when renderer mappings are disabled.
+        need_page_table = true;
+        LOG_INFO("ttbr_remap HLE page-table mode enabled for {}", state.io.title_id);
+    }
+#endif
     if (!init(state.mem, need_page_table)) {
         LOG_ERROR("Failed to initialize memory for emulator state!");
         return false;

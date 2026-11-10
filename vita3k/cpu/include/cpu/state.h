@@ -34,6 +34,7 @@ struct CPUState {
     CPUInterfacePtr cpu;
     bool svc_called;
     uint32_t svc;
+    uint64_t ticks_remaining = CPU_RUN_UNBOUNDED_TICKS;
 
     // Exception handler support (kubridge abort handlers)
     // These are set by the page fault callback (signal-safe atomics)

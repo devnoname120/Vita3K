@@ -38,6 +38,7 @@
 #include <util/log.h>
 #include <util/tracy.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 
@@ -53,6 +54,8 @@ enum class TimerFlags : uint32_t {
 };
 
 TRACY_MODULE_NAME(SceLibKernel);
+
+static std::atomic<uint32_t> fifa_invalid_memcpy_count;
 
 inline static uint64_t get_current_time() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -153,9 +156,40 @@ EXPORT(int, sceClibMemcmpConstTime) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, const void *src, SceSize len) {
+EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, Ptr<const void> src, SceSize len) {
     TRACY_FUNC(sceClibMemcpy, dst, src, len);
-    memcpy(dst.get(emuenv.mem), src, len);
+    if (!copy_guest_memory(emuenv.mem, dst.address(), src.address(), len)) {
+        LOG_ERROR("sceClibMemcpy invalid guest range dst={} src={} len={}",
+            log_hex_full(dst.address()), log_hex_full(src.address()), len);
+        if (emuenv.io.title_id == "FIFA16001") {
+            const uint32_t sequence = fifa_invalid_memcpy_count.fetch_add(1, std::memory_order_relaxed);
+            if (sequence < 16) {
+                const auto thread = emuenv.kernel.get_thread(thread_id);
+                const CPUContext context = thread ? save_context(*thread->cpu) : CPUContext{};
+                Address destination_base = 0;
+                Address source_base = 0;
+                uint32_t destination_size = 0;
+                uint32_t source_size = 0;
+                const bool destination_allocated = find_backing_allocation_range(
+                    emuenv.mem, dst.address(), destination_base, destination_size);
+                const bool source_allocated = find_backing_allocation_range(
+                    emuenv.mem, src.address(), source_base, source_size);
+                LOG_ERROR("FIFA_INVALID_MEMCPY sequence={} thid=0x{:08X} dst={} src={} len=0x{:X} dst_span=0x{:X} src_span=0x{:X} dst_alloc={}@0x{:08X}+0x{:X} src_alloc={}@0x{:08X}+0x{:X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                    sequence, thread_id, log_hex_full(dst.address()), log_hex_full(src.address()), len,
+                    mapped_contiguous_size(emuenv.mem, dst.address(), len),
+                    mapped_contiguous_size(emuenv.mem, src.address(), len),
+                    destination_allocated, destination_base, destination_size,
+                    source_allocated, source_base, source_size,
+                    context.cpu_registers[0], context.cpu_registers[1],
+                    context.cpu_registers[2], context.cpu_registers[3],
+                    context.cpu_registers[4], context.cpu_registers[5],
+                    context.cpu_registers[6], context.cpu_registers[7],
+                    context.cpu_registers[8], context.cpu_registers[9],
+                    context.cpu_registers[10], context.cpu_registers[11],
+                    context.cpu_registers[12], context.get_pc(), context.get_lr(), context.get_sp());
+            }
+        }
+    }
     return dst;
 }
 
@@ -179,7 +213,7 @@ EXPORT(Ptr<void>, sceClibMemcpy_safe, Ptr<void> dst, const Ptr<void> src, SceSiz
     if (dst.address() == src.address()) {
         LOG_ERROR("sceClibMemcpy({},{},{}) src == dst", log_hex_full(src.address()), log_hex_full(dst.address()), len);
         assert(false);
-        CALL_EXPORT(sceClibMemcpy, dst, src.get(emuenv.mem), len);
+        CALL_EXPORT(sceClibMemcpy, dst, src, len);
         return dst;
     }
     const auto diff = std::abs((int)(src.address() - dst.address()));
@@ -187,7 +221,7 @@ EXPORT(Ptr<void>, sceClibMemcpy_safe, Ptr<void> dst, const Ptr<void> src, SceSiz
         LOG_ERROR("sceClibMemcpy({},{},{}) src/dst overlap", log_hex_full(src.address()), log_hex_full(dst.address()), len);
         assert(false);
     }
-    CALL_EXPORT(sceClibMemcpy, dst, src.get(emuenv.mem), len);
+    CALL_EXPORT(sceClibMemcpy, dst, src, len);
     return dst;
 }
 
@@ -639,14 +673,14 @@ EXPORT(int, sceIoOpenAsync) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(SceSSize, sceIoPread, SceUID fd, void *buf, SceSize nbyte, SceOff offset) {
+EXPORT(SceSSize, sceIoPread, SceUID fd, Ptr<void> buf, SceSize nbyte, SceOff offset) {
     TRACY_FUNC(sceIoPread, fd, buf, nbyte, offset);
     auto pos = tell_file(emuenv.io, fd, export_name);
     if (pos < 0) {
         return static_cast<SceSSize>(pos);
     }
     seek_file(fd, offset, SCE_SEEK_SET, emuenv.io, export_name);
-    const auto res = read_file(buf, emuenv.io, fd, nbyte, export_name);
+    const auto res = read_guest_file(buf, emuenv.mem, emuenv.io, fd, nbyte, export_name);
     seek_file(fd, pos, SCE_SEEK_SET, emuenv.io, export_name);
     return res;
 }
@@ -656,14 +690,14 @@ EXPORT(int, sceIoPreadAsync) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(SceSSize, sceIoPwrite, SceUID fd, const void *buf, SceSize nbyte, SceOff offset) {
+EXPORT(SceSSize, sceIoPwrite, SceUID fd, Ptr<const void> buf, SceSize nbyte, SceOff offset) {
     TRACY_FUNC(sceIoPwrite, fd, buf, nbyte, offset);
     auto pos = tell_file(emuenv.io, fd, export_name);
     if (pos < 0) {
         return static_cast<SceSSize>(pos);
     }
     seek_file(fd, offset, SCE_SEEK_SET, emuenv.io, export_name);
-    const auto res = write_file(fd, buf, nbyte, emuenv.io, export_name);
+    const auto res = write_guest_file(fd, buf, emuenv.mem, nbyte, emuenv.io, export_name);
     seek_file(fd, pos, SCE_SEEK_SET, emuenv.io, export_name);
     return res;
 }

@@ -20,6 +20,7 @@
 
 #include <kernel/state.h>
 #include <kernel/types.h>
+#include <mem/functions.h>
 #include <modules/sysmem_state.h>
 
 #include <packages/sfo.h>
@@ -226,6 +227,17 @@ EXPORT(int, sceKernelGetMemBlockInfoByAddr, Address addr, SceKernelMemBlockInfo 
             memcpy(info, block_info.get(), sizeof(SceKernelMemBlockInfo));
             return SCE_KERNEL_OK;
         }
+    }
+
+    Address base = 0;
+    uint32_t size = 0;
+    if (find_backing_allocation_range(emuenv.mem, addr, base, size)) {
+        *info = {};
+        info->size = sizeof(SceKernelMemBlockInfo);
+        info->mappedBase = Ptr<void>(base);
+        info->mappedSize = size;
+        info->type = SCE_KERNEL_MEMBLOCK_TYPE_USER_RW;
+        return SCE_KERNEL_OK;
     }
 
     return SCE_KERNEL_ERROR_BLOCK_ERROR;

@@ -21,6 +21,10 @@
 
 #include <span>
 #include <stack>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #if defined(__x86_64__) && !defined(__APPLE__)
 #include <xxh_x86dispatch.h>
 #else
@@ -28,11 +32,13 @@
 #include <xxhash.h>
 #endif
 
+#include <cpu/functions.h>
 #include <display/functions.h>
 #include <display/state.h>
 #include <gxm/functions.h>
 #include <gxm/state.h>
 #include <gxm/types.h>
+#include <SDL3/SDL_thread.h>
 #include <kernel/state.h>
 #include <mem/state.h>
 
@@ -945,6 +951,34 @@ static void display_entry_thread(EmuEnvState &emuenv) {
     }
 }
 
+static int SDLCALL display_entry_thread_entry(void *data) {
+    display_entry_thread(*static_cast<EmuEnvState *>(data));
+    return 0;
+}
+
+static SDL_Thread *create_display_host_thread(EmuEnvState &emuenv) {
+    SDL_Thread *thread = nullptr;
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    const char *ttbr_hle_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    if (ttbr_hle_title && *ttbr_hle_title) {
+        const SDL_PropertiesID properties = SDL_CreateProperties();
+        if (properties) {
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,
+                reinterpret_cast<void *>(&display_entry_thread_entry));
+            SDL_SetStringProperty(properties, SDL_PROP_THREAD_CREATE_NAME_STRING, "Vita3K GXM Display");
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, &emuenv);
+            SDL_SetNumberProperty(properties, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER,
+                8 * 1024 * 1024);
+            thread = SDL_CreateThreadWithProperties(properties);
+            SDL_DestroyProperties(properties);
+        }
+    }
+#endif
+    if (!thread)
+        thread = SDL_CreateThread(&display_entry_thread_entry, "Vita3K GXM Display", &emuenv);
+    return thread;
+}
+
 static Ptr<void> gxmRunDeferredMemoryCallback(KernelState &kernel, const MemState &mem, std::mutex &global_lock, std::uint32_t &return_size, Ptr<SceGxmDeferredContextCallback> callback, Ptr<void> userdata,
     const std::uint32_t size, const SceUID thread_id) {
     const std::lock_guard<std::mutex> guard(global_lock);
@@ -1529,17 +1563,32 @@ EXPORT(int, sceGxmAddRazorGpuCaptureBuffer) {
 }
 
 static void update_viewport(renderer::State &state, SceGxmContext *context) {
+    const bool wClampEnabled = context->state.w_clamp_mode == SCE_GXM_WCLAMP_MODE_ENABLED;
     if (context->state.viewport.enable == SCE_GXM_VIEWPORT_ENABLED) {
-        renderer::set_viewport_real(state, context->renderer.get(), context->state.viewport.offset.x,
-            context->state.viewport.offset.y, context->state.viewport.offset.z, context->state.viewport.scale.x,
-            context->state.viewport.scale.y, context->state.viewport.scale.z);
+        renderer::set_viewport_real(state, context->renderer.get(), wClampEnabled, context->state.w_clamp_value,
+            context->state.viewport.offset.x, context->state.viewport.offset.y, context->state.viewport.offset.z,
+            context->state.viewport.scale.x, context->state.viewport.scale.y, context->state.viewport.scale.z);
     } else {
-        renderer::set_viewport_flat(state, context->renderer.get());
+        renderer::set_viewport_flat(state, context->renderer.get(), wClampEnabled, context->state.w_clamp_value);
     }
 }
 
 EXPORT(void, sceGxmSetDefaultRegionClipAndViewport, SceGxmContext *context, uint32_t xMax, uint32_t yMax) {
     TRACY_FUNC(sceGxmSetDefaultRegionClipAndViewport, context, xMax, yMax);
+    static uint32_t doubledragon_default_clip_trace_count = 0;
+    const char *const doubledragon_clip_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    if (doubledragon_clip_trace && doubledragon_clip_trace[0] == '1'
+        && doubledragon_clip_trace[1] == 0 && context
+        && doubledragon_default_clip_trace_count < 128) {
+        std::fprintf(stderr,
+            "VITA3K_DDRG_DEFAULT_CLIP call=%u context=%p active=%u alloc=%u input_max=%u,%u prior_mode=%u prior=%u,%u,%u,%u\n",
+            ++doubledragon_default_clip_trace_count, static_cast<void *>(context),
+            static_cast<unsigned>(context->state.active), static_cast<unsigned>(context->alloc_space.address() != 0),
+            xMax, yMax, static_cast<unsigned>(context->state.region_clip_mode),
+            context->state.region_clip_min.x, context->state.region_clip_min.y,
+            context->state.region_clip_max.x, context->state.region_clip_max.y);
+        std::fflush(stderr);
+    }
     const std::uint32_t xMin = 0;
     const std::uint32_t yMin = 0;
 
@@ -2369,11 +2418,34 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
     }
 
     // set textures that are dirty
+    static uint32_t masseffect_draw_texture_trace_count = 0;
     const gxp::TextureInfo vert_textures_sync = gxm_vertex_program.renderer_data->textures_used & context->is_vert_texture_dirty;
     context->is_vert_texture_dirty &= ~vert_textures_sync;
+    const gxp::TextureInfo frag_textures_dirty = context->is_frag_texture_dirty;
     const gxp::TextureInfo frag_textures_sync = gxm_fragment_program.renderer_data->textures_used & context->is_frag_texture_dirty;
     context->is_frag_texture_dirty &= ~frag_textures_sync;
     const auto &textures = context->state.textures;
+    const char *const masseffect_texture_trace = std::getenv("VITA3K_ME_TEXTURE_SLOT_TRACE");
+    if (masseffect_texture_trace && masseffect_texture_trace[0] == '1'
+        && masseffect_texture_trace[1] == 0 && masseffect_draw_texture_trace_count < 256) {
+        const SceGxmTexture &texture1 = textures[1];
+        const uint32_t width1 = gxm::get_width(texture1);
+        const uint32_t height1 = gxm::get_height(texture1);
+        if (width1 >= 2048 && height1 >= 2048) {
+            const SceGxmTexture &texture0 = textures[0];
+            const uint32_t call = ++masseffect_draw_texture_trace_count;
+            std::fprintf(stderr,
+                "VITA3K_ME_DRAW_TEXTURES call=%u used=0x%04lX dirty=0x%04lX sync=0x%04lX slot0=0x%08X:%08X:%ux%u slot1=0x%08X:%08X:%ux%u\n",
+                call,
+                static_cast<unsigned long>(gxm_fragment_program.renderer_data->textures_used.to_ulong()),
+                static_cast<unsigned long>(frag_textures_dirty.to_ulong()),
+                static_cast<unsigned long>(frag_textures_sync.to_ulong()),
+                texture0.data_addr << 2, static_cast<unsigned>(gxm::get_format(texture0)),
+                gxm::get_width(texture0), gxm::get_height(texture0),
+                texture1.data_addr << 2, static_cast<unsigned>(gxm::get_format(texture1)),
+                width1, height1);
+        }
+    }
     for (uint16_t texture_index = 0; texture_index < SCE_GXM_MAX_TEXTURE_UNITS; texture_index++) {
         if (vert_textures_sync[texture_index]) {
             const uint16_t index_position = SCE_GXM_MAX_TEXTURE_UNITS + texture_index;
@@ -2411,6 +2483,72 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
         }
 
         stream_used |= (1 << attribute.streamIndex);
+    }
+
+    static uint32_t doubledragon_target_draw_trace_count = 0;
+    const char *const doubledragon_draw_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    if (doubledragon_draw_trace && doubledragon_draw_trace[0] == '1'
+        && doubledragon_draw_trace[1] == 0 && indexCount == 6
+        && (stream_used & 1u) && max_data_length[0] >= 48
+        && context->state.stream_data[0]
+        && doubledragon_target_draw_trace_count < 128) {
+        const float *const values = context->state.stream_data[0].cast<const float>().get(emuenv.mem);
+        const bool target = values
+            && values[0] == 0.0f && values[1] == 0.0f && values[2] == -80.0f
+            && values[3] == 0.0f && values[4] == -320.0f && values[5] == -80.0f
+            && values[6] == 480.0f && values[7] == -320.0f && values[8] == -80.0f
+            && values[9] == 480.0f && values[10] == 0.0f && values[11] == -80.0f;
+        if (target) {
+            const uint32_t target_call = ++doubledragon_target_draw_trace_count;
+            uint64_t vertex_hash_prefix = 0;
+            std::memcpy(&vertex_hash_prefix, gxm_vertex_program.renderer_data->hash.data(), sizeof(vertex_hash_prefix));
+            std::fprintf(stderr,
+                "VITA3K_DDRG_TARGET_DRAW call=%u context=%p primitive=%u index_type=%u index_count=%u stream0=0x%08X stream0_size=%zu vertex_program=0x%08X vertex_hash=%016llX region_mode=%u region=%u,%u,%u,%u viewport_enable=%u viewport=%g,%g,%g,%g,%g,%g vertices=%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g\n",
+                target_call, static_cast<void *>(context),
+                static_cast<unsigned>(primType), static_cast<unsigned>(indexType), indexCount,
+                context->state.stream_data[0].address(), max_data_length[0],
+                context->state.vertex_program.address(), static_cast<unsigned long long>(vertex_hash_prefix),
+                static_cast<unsigned>(context->state.region_clip_mode),
+                context->state.region_clip_min.x, context->state.region_clip_min.y,
+                context->state.region_clip_max.x, context->state.region_clip_max.y,
+                static_cast<unsigned>(context->state.viewport.enable),
+                context->state.viewport.offset.x, context->state.viewport.offset.y, context->state.viewport.offset.z,
+                context->state.viewport.scale.x, context->state.viewport.scale.y, context->state.viewport.scale.z,
+                values[0], values[1], values[2], values[3], values[4], values[5],
+                values[6], values[7], values[8], values[9], values[10], values[11]);
+            if (target_call <= 4) {
+                for (size_t index = 0; index < gxm_vertex_program.attributes.size(); ++index) {
+                    const auto &attribute = gxm_vertex_program.attributes[index];
+                    std::fprintf(stderr,
+                        "VITA3K_DDRG_TARGET_ATTRIBUTE call=%u index=%zu reg=%u stream=%u offset=%u format=%u components=%u\n",
+                        target_call, index, attribute.regIndex, attribute.streamIndex, attribute.offset,
+                        static_cast<unsigned>(attribute.format), attribute.componentCount);
+                }
+                for (size_t index = 0; index < gxm_vertex_program.streams.size(); ++index) {
+                    const auto &stream = gxm_vertex_program.streams[index];
+                    std::fprintf(stderr,
+                        "VITA3K_DDRG_TARGET_STREAM call=%u index=%zu stride=%u index_source=%u address=0x%08X size=%zu\n",
+                        target_call, index, stream.stride, stream.indexSource,
+                        context->state.stream_data[index].address(), max_data_length[index]);
+                }
+                const auto &uniform_sizes = gxm_vertex_program.renderer_data->uniform_buffer_sizes;
+                for (size_t block = 0; block < uniform_sizes.size(); ++block) {
+                    const UniformBuffer uniform = context->state.vertex_uniform_buffers[block];
+                    const uint32_t float_count = uniform_sizes.at(block);
+                    if (!uniform || !float_count)
+                        continue;
+                    const uint32_t copied_floats = std::min<uint32_t>(float_count, 64);
+                    const uint8_t *const bytes = uniform.cast<const uint8_t>().get(emuenv.mem);
+                    std::fprintf(stderr,
+                        "VITA3K_DDRG_TARGET_UB_SOURCE call=%u block=%zu address=0x%08X floats=%u copied=%u bytes=",
+                        target_call, block, uniform.address(), float_count, copied_floats);
+                    for (uint32_t index = 0; bytes && index < copied_floats * 4; ++index)
+                        std::fprintf(stderr, "%02X", bytes[index]);
+                    std::fputc('\n', stderr);
+                }
+            }
+            std::fflush(stderr);
+        }
     }
 
     // Copy and queue upload
@@ -2894,7 +3032,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
 
     // Reset the queue in case sceGxmTerminate was called earlier
     emuenv.gxm.display_queue.reset();
-    emuenv.gxm.display_host_thread = std::thread(display_entry_thread, std::ref(emuenv));
+    emuenv.gxm.display_host_thread = create_display_host_thread(emuenv);
     emuenv.gxm.notification_region = Ptr<uint32_t>(alloc(emuenv.mem, MiB(1), "SceGxmNotificationRegion"));
     memset(emuenv.gxm.notification_region.get(emuenv.mem), 0, MiB(1));
     return 0;
@@ -3430,6 +3568,17 @@ EXPORT(Ptr<SceGxmProgramParameter>, _sceGxmProgramFindParameterBySemantic, Ptr<c
 
 EXPORT(uint32_t, sceGxmProgramGetDefaultUniformBufferSize, const SceGxmProgram *program) {
     TRACY_FUNC(sceGxmProgramGetDefaultUniformBufferSize, program);
+    if (emuenv.io.title_id == "DDRG00001" && !program) {
+        const auto thread = emuenv.kernel.get_thread(thread_id);
+        const CPUContext context = thread ? save_context(*thread->cpu) : CPUContext{};
+        std::fprintf(stderr,
+            "DDRG_NULL_GXM_PROGRAM thid=0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X pc=0x%08X lr=0x%08X sp=0x%08X\n",
+            thread_id,
+            context.cpu_registers[0], context.cpu_registers[1],
+            context.cpu_registers[2], context.cpu_registers[3],
+            context.get_pc(), context.get_lr(), context.get_sp());
+        std::fflush(stderr);
+    }
     return program->default_uniform_buffer_count * sizeof(Ptr<const void>);
 }
 
@@ -3959,12 +4108,30 @@ EXPORT(void, sceGxmSetFragmentProgram, SceGxmContext *context, Ptr<const SceGxmF
 }
 
 EXPORT(int, sceGxmSetFragmentTexture, SceGxmContext *context, uint32_t textureIndex, const SceGxmTexture *texture) {
+    static uint32_t masseffect_texture_trace_count = 0;
     TRACY_FUNC(sceGxmSetFragmentTexture, context, textureIndex, texture);
     if (!context || !texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
     if (textureIndex > (SCE_GXM_MAX_TEXTURE_UNITS - 1)) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
+    const char *const masseffect_texture_trace = std::getenv("VITA3K_ME_TEXTURE_SLOT_TRACE");
+    if (masseffect_texture_trace && masseffect_texture_trace[0] == '1'
+        && masseffect_texture_trace[1] == 0 && textureIndex < 2
+        && masseffect_texture_trace_count < 512) {
+        const uint32_t width = gxm::get_width(*texture);
+        const uint32_t height = gxm::get_height(*texture);
+        if (width >= 1024 && height >= 1024) {
+            const uint32_t call = ++masseffect_texture_trace_count;
+            std::fprintf(stderr,
+                "VITA3K_ME_SET_FRAGMENT_TEXTURE call=%u slot=%u data=0x%08X format=0x%08X size=%ux%u mips=%u control=%08X,%08X,%08X,%08X\n",
+                call, textureIndex, texture->data_addr << 2, static_cast<unsigned>(gxm::get_format(*texture)),
+                width, height, texture->true_mip_count(),
+                reinterpret_cast<const uint32_t *>(texture)[0], reinterpret_cast<const uint32_t *>(texture)[1],
+                reinterpret_cast<const uint32_t *>(texture)[2], reinterpret_cast<const uint32_t *>(texture)[3]);
+        }
     }
 
     context->state.textures[textureIndex] = *texture;
@@ -4143,6 +4310,21 @@ EXPORT(void, sceGxmSetPrecomputedVertexState, SceGxmContext *context, Ptr<SceGxm
 
 EXPORT(void, sceGxmSetRegionClip, SceGxmContext *context, SceGxmRegionClipMode mode, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax) {
     TRACY_FUNC(sceGxmSetRegionClip, context, mode, xMin, yMin, xMax, yMax);
+    static uint32_t doubledragon_region_clip_trace_count = 0;
+    const char *const doubledragon_clip_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    if (doubledragon_clip_trace && doubledragon_clip_trace[0] == '1'
+        && doubledragon_clip_trace[1] == 0 && context
+        && doubledragon_region_clip_trace_count < 512) {
+        std::fprintf(stderr,
+            "VITA3K_DDRG_REGION_CLIP call=%u context=%p active=%u alloc=%u input_mode=%u input=%u,%u,%u,%u prior_mode=%u prior=%u,%u,%u,%u\n",
+            ++doubledragon_region_clip_trace_count, static_cast<void *>(context),
+            static_cast<unsigned>(context->state.active), static_cast<unsigned>(context->alloc_space.address() != 0),
+            static_cast<unsigned>(mode), xMin, yMin, xMax, yMax,
+            static_cast<unsigned>(context->state.region_clip_mode),
+            context->state.region_clip_min.x, context->state.region_clip_min.y,
+            context->state.region_clip_max.x, context->state.region_clip_max.y);
+        std::fflush(stderr);
+    }
     bool change_detected = false;
 
     if (context->state.region_clip_mode != mode) {
@@ -4388,6 +4570,22 @@ EXPORT(int, sceGxmSetVertexUniformBuffer, SceGxmContext *context, uint32_t buffe
 
 EXPORT(void, sceGxmSetViewport, SceGxmContext *context, float xOffset, float xScale, float yOffset, float yScale, float zOffset, float zScale) {
     TRACY_FUNC(sceGxmSetViewport, context, xOffset, xScale, yOffset, yScale, zOffset, zScale);
+    static uint32_t doubledragon_viewport_trace_count = 0;
+    const char *const doubledragon_viewport_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
+    if (doubledragon_viewport_trace && doubledragon_viewport_trace[0] == '1'
+        && doubledragon_viewport_trace[1] == 0 && context
+        && doubledragon_viewport_trace_count < 64) {
+        std::fprintf(stderr,
+            "VITA3K_DDRG_GXM_VIEWPORT call=%u context=%p active=%u alloc=%u enable=%u input=%g,%g,%g,%g,%g,%g prior=%g,%g,%g,%g,%g,%g\n",
+            ++doubledragon_viewport_trace_count, static_cast<void *>(context),
+            static_cast<unsigned>(context->state.active), static_cast<unsigned>(context->alloc_space.address() != 0),
+            static_cast<unsigned>(context->state.viewport.enable),
+            xOffset, xScale, yOffset, yScale, zOffset, zScale,
+            context->state.viewport.offset.x, context->state.viewport.scale.x,
+            context->state.viewport.offset.y, context->state.viewport.scale.y,
+            context->state.viewport.offset.z, context->state.viewport.scale.z);
+        std::fflush(stderr);
+    }
     // Set viewport to enable, enable more offset and scale to set
     if (context->state.viewport.offset.x != xOffset || (context->state.viewport.offset.y != yOffset) || (context->state.viewport.offset.z != zOffset)
         || (context->state.viewport.scale.x != xScale) || (context->state.viewport.scale.y != yScale) || (context->state.viewport.scale.z != zScale)) {
@@ -4453,14 +4651,32 @@ EXPORT(void, sceGxmSetWBufferEnable) {
     UNIMPLEMENTED();
 }
 
-EXPORT(void, sceGxmSetWClampEnable) {
-    TRACY_FUNC(sceGxmSetWClampEnable);
-    UNIMPLEMENTED();
+EXPORT(void, sceGxmSetWClampEnable, SceGxmContext *context, SceGxmWClampMode enable) {
+    TRACY_FUNC(sceGxmSetWClampEnable, context, enable);
+    if (!context || context->state.w_clamp_mode == enable)
+        return;
+
+    context->state.w_clamp_mode = enable;
+    if (!context->state.active) {
+        LOG_WARN_ONCE("The call was made outside of the Scene. It will be applied when the next Scene is called.");
+        return;
+    }
+    if (context->alloc_space)
+        update_viewport(*emuenv.renderer, context);
 }
 
 EXPORT(void, sceGxmSetWClampValue, SceGxmContext *context, float clampValue) {
     TRACY_FUNC(sceGxmSetWClampValue, context, clampValue);
-    UNIMPLEMENTED();
+    if (!context || context->state.w_clamp_value == clampValue)
+        return;
+
+    context->state.w_clamp_value = clampValue;
+    if (!context->state.active) {
+        LOG_WARN_ONCE("The call was made outside of the Scene. It will be applied when the next Scene is called.");
+        return;
+    }
+    if (context->alloc_space)
+        update_viewport(*emuenv.renderer, context);
 }
 
 EXPORT(int, sceGxmSetWarningEnabled) {
@@ -4510,6 +4726,48 @@ static void free_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShaderP
 template <typename T>
 static void free_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShaderPatcher *shaderPatcher, Ptr<T> data) {
     free_callbacked(emuenv, thread_id, shaderPatcher, data.address());
+}
+
+static std::mutex archetype_registered_program_mutex;
+static std::unordered_map<Address, Address> archetype_registered_programs;
+
+static bool archetype_registered_program_pages_enabled(const EmuEnvState &emuenv) {
+    const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    return requested_title && emuenv.io.title_id == requested_title && emuenv.io.title_id == "ARCH00001";
+}
+
+static void track_archetype_registered_program(Address program, Address patcher) {
+    const std::lock_guard<std::mutex> lock(archetype_registered_program_mutex);
+    archetype_registered_programs[program] = patcher;
+}
+
+static bool free_archetype_registered_program(EmuEnvState &emuenv, Address program) {
+    {
+        const std::lock_guard<std::mutex> lock(archetype_registered_program_mutex);
+        const auto it = archetype_registered_programs.find(program);
+        if (it == archetype_registered_programs.end())
+            return false;
+        archetype_registered_programs.erase(it);
+    }
+    free(emuenv.mem, program);
+    return true;
+}
+
+static void free_archetype_registered_programs(EmuEnvState &emuenv, Address patcher) {
+    std::vector<Address> programs;
+    {
+        const std::lock_guard<std::mutex> lock(archetype_registered_program_mutex);
+        for (auto it = archetype_registered_programs.begin(); it != archetype_registered_programs.end();) {
+            if (it->second == patcher) {
+                programs.push_back(it->first);
+                it = archetype_registered_programs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const Address program : programs)
+        free(emuenv.mem, program);
 }
 
 EXPORT(int, sceGxmShaderPatcherAddRefFragmentProgram, SceGxmShaderPatcher *shaderPatcher, SceGxmFragmentProgram *fragmentProgram) {
@@ -4619,7 +4877,43 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
 
 EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, const SceGxmVertexAttribute *attributes, uint32_t attributeCount, const SceGxmVertexStream *streams, uint32_t streamCount, Ptr<SceGxmVertexProgram> *vertexProgram) {
     TRACY_FUNC(sceGxmShaderPatcherCreateVertexProgram, shaderPatcher, programId, attributes, attributeCount, streams, streamCount, vertexProgram);
+    if (emuenv.io.title_id == "FIFA16001") {
+        std::fprintf(stderr,
+            "FIFA_GXM_HLE_DECODED thread=%d attribute_count=%u stream_count=%u attributes=%p streams=%p\n",
+            thread_id, attributeCount, streamCount,
+            static_cast<const void *>(attributes), static_cast<const void *>(streams));
+        std::fflush(stderr);
+    }
     MemState &mem = emuenv.mem;
+    const bool doubledragon_diag = emuenv.io.title_id == "DDRG00001";
+    if (doubledragon_diag) {
+        const Address attribute_address = attributes ? Ptr<const SceGxmVertexAttribute>(attributes, mem).address() : 0;
+        const Address stream_address = streams ? Ptr<const SceGxmVertexStream>(streams, mem).address() : 0;
+        const uint64_t attribute_bytes = uint64_t(sizeof(SceGxmVertexAttribute)) * attributeCount;
+        const uint64_t stream_bytes = uint64_t(sizeof(SceGxmVertexStream)) * streamCount;
+        const uint64_t attribute_end = uint64_t(attribute_address) + attribute_bytes;
+        const uint64_t stream_end = uint64_t(stream_address) + stream_bytes;
+        const bool attribute_range_valid = attributes && attribute_end < 0x100000000ULL
+            && is_valid_addr_range(mem, attribute_address, static_cast<Address>(attribute_end));
+        const bool stream_range_valid = streams && stream_end < 0x100000000ULL
+            && is_valid_addr_range(mem, stream_address, static_cast<Address>(stream_end));
+        Address attribute_allocation = 0;
+        Address stream_allocation = 0;
+        uint32_t attribute_allocation_size = 0;
+        uint32_t stream_allocation_size = 0;
+        const bool attribute_allocation_found = attributes
+            && find_backing_allocation_range(mem, attribute_address, attribute_allocation, attribute_allocation_size);
+        const bool stream_allocation_found = streams
+            && find_backing_allocation_range(mem, stream_address, stream_allocation, stream_allocation_size);
+        std::fprintf(stderr,
+            "DDRG_GXM_VERTEX_ARGS thread=%d attr=0x%08X attr_count=%u attr_bytes=%llu attr_end=0x%llX attr_valid=%d attr_alloc=%d:0x%08X+0x%X stream=0x%08X stream_count=%u stream_bytes=%llu stream_end=0x%llX stream_valid=%d stream_alloc=%d:0x%08X+0x%X\n",
+            thread_id, attribute_address, attributeCount, static_cast<unsigned long long>(attribute_bytes),
+            static_cast<unsigned long long>(attribute_end), attribute_range_valid, attribute_allocation_found,
+            attribute_allocation, attribute_allocation_size, stream_address, streamCount,
+            static_cast<unsigned long long>(stream_bytes), static_cast<unsigned long long>(stream_end),
+            stream_range_valid, stream_allocation_found, stream_allocation, stream_allocation_size);
+        std::fflush(stderr);
+    }
 
     if (!shaderPatcher || !programId || !vertexProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4630,11 +4924,27 @@ EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderP
     };
 
     if (attributes) {
+        if (doubledragon_diag) {
+            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH attributes begin\n");
+            std::fflush(stderr);
+        }
         key.hash = hash_data(attributes, sizeof(SceGxmVertexAttribute) * attributeCount);
+        if (doubledragon_diag) {
+            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH attributes end hash=0x%08X\n", key.hash);
+            std::fflush(stderr);
+        }
     }
 
     if (streams) {
+        if (doubledragon_diag) {
+            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH streams begin\n");
+            std::fflush(stderr);
+        }
         key.hash ^= hash_data(streams, sizeof(SceGxmVertexStream) * streamCount);
+        if (doubledragon_diag) {
+            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH streams end hash=0x%08X\n", key.hash);
+            std::fflush(stderr);
+        }
     }
 
     VertexProgramCache::const_iterator cached = shaderPatcher->vertex_program_cache.find(key);
@@ -4676,6 +4986,7 @@ EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) 
     if (!shaderPatcher)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    free_archetype_registered_programs(emuenv, shaderPatcher.address());
     free_callbacked(emuenv, thread_id, shaderPatcher.get(emuenv.mem), shaderPatcher);
 
     return 0;
@@ -4719,7 +5030,8 @@ EXPORT(int, sceGxmShaderPatcherForceUnregisterProgram, SceGxmShaderPatcher *shad
     }
 
     rp->program.reset();
-    free_callbacked(emuenv, thread_id, shaderPatcher, programId);
+    if (!free_archetype_registered_program(emuenv, programId.address()))
+        free_callbacked(emuenv, thread_id, shaderPatcher, programId);
 
     return 0;
 }
@@ -4755,7 +5067,15 @@ EXPORT(Ptr<const SceGxmProgram>, sceGxmShaderPatcherGetProgramFromId, SceGxmShad
         return Ptr<const SceGxmProgram>();
     }
 
-    return programId.get(emuenv.mem)->program;
+    const Ptr<const SceGxmProgram> program = programId.get(emuenv.mem)->program;
+    const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    if (requested_title && emuenv.io.title_id == requested_title && emuenv.io.title_id == "ARCH00001") {
+        static uint32_t archetype_get_program_call = 0;
+        std::fprintf(stderr, "ARCHETYPE_GXM_GET_PROGRAM call=%u id=0x%08X program=0x%08X\n",
+            ++archetype_get_program_call, programId.address(), program.address());
+        std::fflush(stderr);
+    }
+    return program;
 }
 
 EXPORT(Ptr<void>, sceGxmShaderPatcherGetUserData, const SceGxmShaderPatcher *shaderPatcher) {
@@ -4786,7 +5106,146 @@ EXPORT(int, sceGxmShaderPatcherRegisterProgram, SceGxmShaderPatcher *shaderPatch
     if (!shaderPatcher || !programHeader || !programId)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    *programId = alloc_callbacked<SceGxmRegisteredProgram>(emuenv, thread_id, shaderPatcher);
+    const bool archetype = archetype_registered_program_pages_enabled(emuenv);
+    static uint32_t archetype_register_call = 0;
+    const uint32_t call = archetype ? ++archetype_register_call : 0;
+    const char *const mode = archetype ? std::getenv("VITA3K_ARCHETYPE_GXM_REGISTER_MODE") : nullptr;
+    const char *const target_text = archetype ? std::getenv("VITA3K_ARCHETYPE_GXM_REGISTER_TARGET") : nullptr;
+    const uint32_t target = target_text ? static_cast<uint32_t>(std::strtoul(target_text, nullptr, 0)) : 0;
+    const bool selected = mode && (!target || call >= target);
+    static Ptr<SceGxmRegisteredProgram> archetype_pool;
+    static uint32_t archetype_pool_next = 0;
+    constexpr uint32_t archetype_pool_bytes = 0x1000u;
+    constexpr uint32_t archetype_pool_capacity = archetype_pool_bytes / sizeof(SceGxmRegisteredProgram);
+    const bool reuse_mode = mode && !std::strncmp(mode, "reuse", 5);
+    if (archetype && reuse_mode && call == 1) {
+        archetype_pool = Ptr<SceGxmRegisteredProgram>(alloc_callbacked(
+            emuenv, thread_id, shaderPatcher->params, archetype_pool_bytes));
+        if (!archetype_pool)
+            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_POOL base=0x%08X bytes=0x%X capacity=%u\n",
+            archetype_pool.address(), archetype_pool_bytes, archetype_pool_capacity);
+        std::fflush(stderr);
+    }
+    if (archetype) {
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER call=%u mode=%s target=%u program=0x%08X out=%p\n",
+            call, mode ? mode : "direct", target, programHeader.address(), static_cast<void *>(programId));
+        std::fflush(stderr);
+    }
+    if (selected && !std::strcmp(mode, "noop")) {
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=noop\n", call);
+        std::fflush(stderr);
+        return 0;
+    }
+    if (selected && !std::strcmp(mode, "write")) {
+        *programId = Ptr<SceGxmRegisteredProgram>(0x12345000u);
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=write id=0x%08X\n", call, programId->address());
+        std::fflush(stderr);
+        return 0;
+    }
+    if (selected && !std::strcmp(mode, "alloc-only")) {
+        const Ptr<SceGxmRegisteredProgram> scratch(alloc(emuenv.mem, sizeof(SceGxmRegisteredProgram), "ArchetypeHD shader registration allocation probe"));
+        if (!scratch)
+            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
+        new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+        scratch.get(emuenv.mem)->program = programHeader;
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=alloc-only id=0x%08X\n", call, scratch.address());
+        std::fflush(stderr);
+        return 0;
+    }
+    if (selected && !std::strcmp(mode, "alloc-raw")) {
+        const Ptr<SceGxmRegisteredProgram> scratch(alloc(emuenv.mem, sizeof(SceGxmRegisteredProgram), "ArchetypeHD raw allocation probe"));
+        if (!scratch)
+            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=alloc-raw id=0x%08X\n", call, scratch.address());
+        std::fflush(stderr);
+        return 0;
+    }
+    const bool host_mode = mode && !std::strncmp(mode, "alloc-host-", 11);
+    if (selected && host_mode) {
+        static Ptr<SceGxmRegisteredProgram> scratch;
+        if (call == target) {
+            scratch = Ptr<SceGxmRegisteredProgram>(alloc_aligned(emuenv.mem,
+                sizeof(SceGxmRegisteredProgram), "ArchetypeHD host-page registration probe",
+                emuenv.mem.host_page_size));
+            if (!scratch)
+                return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
+        }
+        const char *action = mode;
+        if (!std::strcmp(mode, "alloc-host-zero")) {
+            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+        } else if (!std::strcmp(mode, "alloc-host-program")) {
+            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+            scratch.get(emuenv.mem)->program = programHeader;
+        } else if (!std::strcmp(mode, "alloc-host-output")) {
+            *programId = scratch;
+        } else if (!std::strcmp(mode, "alloc-host-full")) {
+            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+            scratch.get(emuenv.mem)->program = programHeader;
+            *programId = scratch;
+        } else if (!std::strcmp(mode, "alloc-host-full-clear-output")) {
+            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+            scratch.get(emuenv.mem)->program = programHeader;
+            *programId = scratch;
+            programId->reset();
+        } else if (!std::strcmp(mode, "alloc-host-full-clear-record")) {
+            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+            scratch.get(emuenv.mem)->program = programHeader;
+            *programId = scratch;
+            scratch.get(emuenv.mem)->program.reset();
+        } else if (!std::strcmp(mode, "alloc-host-full-clear-both")) {
+            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
+            scratch.get(emuenv.mem)->program = programHeader;
+            *programId = scratch;
+            scratch.get(emuenv.mem)->program.reset();
+            programId->reset();
+        } else if (std::strcmp(mode, "alloc-host-page")) {
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+        }
+        std::fprintf(stderr,
+            "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=%s id=0x%08X program=0x%08X host_page=0x%X\n",
+            call, action, scratch.address(), programHeader.address(), emuenv.mem.host_page_size);
+        std::fflush(stderr);
+        return 0;
+    }
+    if (selected && reuse_mode) {
+        if (!archetype_pool || archetype_pool_next >= archetype_pool_capacity)
+            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
+        const Ptr<SceGxmRegisteredProgram> slot(archetype_pool.address()
+            + archetype_pool_next++ * sizeof(SceGxmRegisteredProgram));
+        const char *action = mode;
+        if (!std::strcmp(mode, "reuse-zero")) {
+            new (slot.get(emuenv.mem)) SceGxmRegisteredProgram;
+        } else if (!std::strcmp(mode, "reuse-program")) {
+            new (slot.get(emuenv.mem)) SceGxmRegisteredProgram;
+            slot.get(emuenv.mem)->program = programHeader;
+        } else if (!std::strcmp(mode, "reuse-output")) {
+            *programId = slot;
+        } else if (!std::strcmp(mode, "reuse")) {
+            new (slot.get(emuenv.mem)) SceGxmRegisteredProgram;
+            slot.get(emuenv.mem)->program = programHeader;
+            *programId = slot;
+        } else if (std::strcmp(mode, "reuse-raw")) {
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+        }
+        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=%s id=0x%08X slot=%u\n",
+            call, action, slot.address(), archetype_pool_next - 1u);
+        std::fflush(stderr);
+        return 0;
+    }
+    if (archetype && !mode) {
+        *programId = Ptr<SceGxmRegisteredProgram>(alloc_aligned(emuenv.mem,
+            sizeof(SceGxmRegisteredProgram), "ArchetypeHD isolated shader registration",
+            emuenv.mem.host_page_size));
+        if (*programId) {
+            new (programId->get(emuenv.mem)) SceGxmRegisteredProgram;
+            const Address patcher_address = Ptr<SceGxmShaderPatcher>(shaderPatcher, emuenv.mem).address();
+            track_archetype_registered_program(programId->address(), patcher_address);
+        }
+        LOG_INFO("ArchetypeHD shader registration isolated id={} program={}", log_hex(programId->address()), log_hex(programHeader.address()));
+    } else {
+        *programId = alloc_callbacked<SceGxmRegisteredProgram>(emuenv, thread_id, shaderPatcher);
+    }
     assert(*programId);
     if (!*programId) {
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
@@ -4866,7 +5325,8 @@ EXPORT(int, sceGxmShaderPatcherUnregisterProgram, SceGxmShaderPatcher *shaderPat
     SceGxmRegisteredProgram *const rp = programId.get(emuenv.mem);
     rp->program.reset();
 
-    free_callbacked(emuenv, thread_id, shaderPatcher, programId);
+    if (!free_archetype_registered_program(emuenv, programId.address()))
+        free_callbacked(emuenv, thread_id, shaderPatcher, programId);
 
     return 0;
 }
@@ -4912,9 +5372,9 @@ EXPORT(int, sceGxmTerminate) {
     gxm::destroy_all_contexts(emuenv, false);
     gxm::destroy_all_render_targets(emuenv, false);
     emuenv.gxm.display_queue.abort();
-    // a later sceGxmInitialize reassigns this std::thread, which terminates if still joinable
-    if (emuenv.gxm.display_host_thread.joinable())
-        emuenv.gxm.display_host_thread.join();
+    if (emuenv.gxm.display_host_thread)
+        SDL_WaitThread(emuenv.gxm.display_host_thread, nullptr);
+    emuenv.gxm.display_host_thread = nullptr;
     emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->exit_delete();
     return 0;
 }

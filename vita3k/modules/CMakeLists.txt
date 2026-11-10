@@ -216,6 +216,16 @@ set(SOURCE_LIST
 	SceWlanBt/SceWlan.cpp
 )
 
+if(VITA3K_ENABLE_TTBR_REMAP_HLE)
+    list(APPEND SOURCE_LIST ttbr_remap/ttbr_remap.cpp)
+endif()
+
+if(VITA3K_ENABLE_TTBR_REMAP_HLE AND NOT ANDROID)
+    add_executable(ttbr-remap-tests ttbr_remap/mapping_policy_tests.cpp)
+    target_link_libraries(ttbr-remap-tests PRIVATE googletest util)
+    add_test(NAME ttbr-remap COMMAND ttbr-remap-tests)
+endif()
+
 if(APPLE)
     list(APPEND SOURCE_LIST
         SceNet/macos_net_helper.h

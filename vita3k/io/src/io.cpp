@@ -23,6 +23,9 @@
 #include <io/util.h>
 #include <io/vfs.h>
 
+#include <mem/functions.h>
+#include <mem/ptr.h>
+#include <mem/state.h>
 #include <rtc/rtc.h>
 #include <util/log.h>
 #include <util/preprocessor.h>
@@ -411,6 +414,49 @@ int read_file(void *data, IOState &io, const SceUID fd, const SceSize size, cons
     return IO_ERROR(SCE_ERROR_ERRNO_EBADFD);
 }
 
+namespace {
+bool valid_guest_io_range(const MemState &mem, const Address address, const SceSize size) {
+    if (size == 0)
+        return true;
+    if (!address || uint64_t(address) + size > 0x100000000ull)
+        return false;
+
+    uint64_t current = address;
+    uint32_t remaining = size;
+    while (remaining) {
+        const uint32_t span = mapped_contiguous_size(mem, static_cast<Address>(current), remaining);
+        if (!span)
+            return false;
+        current += span;
+        remaining -= span;
+    }
+    return true;
+}
+} // namespace
+
+int read_guest_file(Ptr<void> data, MemState &mem, IOState &io, const SceUID fd, const SceSize size, const char *export_name) {
+    if (!valid_guest_io_range(mem, data.address(), size))
+        return IO_ERROR(SCE_ERROR_ERRNO_EFAULT);
+    if (size == 0)
+        return 0;
+
+    uint64_t current = data.address();
+    uint32_t remaining = size;
+    int total = 0;
+    while (remaining) {
+        const uint32_t span = mapped_contiguous_size(mem, static_cast<Address>(current), remaining);
+        const int read = read_file(Ptr<void>(static_cast<Address>(current)).get(mem), io, fd, span, export_name);
+        if (read <= 0)
+            return total ? total : read;
+        total += read;
+        if (static_cast<uint32_t>(read) < span)
+            break;
+        current += span;
+        remaining -= span;
+    }
+    return total;
+}
+
 int write_file(SceUID fd, const void *data, const SceSize size, const IOState &io, const char *export_name) {
     assert(data != nullptr);
     assert(size >= 0);
@@ -454,6 +500,29 @@ int write_file(SceUID fd, const void *data, const SceSize size, const IOState &i
     }
 
     return IO_ERROR(SCE_ERROR_ERRNO_EBADFD);
+}
+
+int write_guest_file(const SceUID fd, Ptr<const void> data, const MemState &mem, const SceSize size, const IOState &io, const char *export_name) {
+    if (!valid_guest_io_range(mem, data.address(), size))
+        return IO_ERROR(SCE_ERROR_ERRNO_EFAULT);
+    if (size == 0)
+        return 0;
+
+    uint64_t current = data.address();
+    uint32_t remaining = size;
+    int total = 0;
+    while (remaining) {
+        const uint32_t span = mapped_contiguous_size(mem, static_cast<Address>(current), remaining);
+        const int written = write_file(fd, Ptr<const void>(static_cast<Address>(current)).get(mem), span, io, export_name);
+        if (written <= 0)
+            return total ? total : written;
+        total += written;
+        if (static_cast<uint32_t>(written) < span)
+            break;
+        current += span;
+        remaining -= span;
+    }
+    return total;
 }
 
 int truncate_file(const SceUID fd, unsigned long long length, const IOState &io, const char *export_name) {

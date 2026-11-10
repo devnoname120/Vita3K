@@ -555,6 +555,12 @@ void ThreadState::resume(bool step) {
     }
 }
 
+bool ThreadState::can_resume_nested_run() {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return status == ThreadStatus::running &&
+        !exit_requested && !delete_requested && !suspend_requested;
+}
+
 std::string ThreadState::log_stack_traceback() const {
     constexpr Address START_OFFSET = 0;
     constexpr Address END_OFFSET = 1024;

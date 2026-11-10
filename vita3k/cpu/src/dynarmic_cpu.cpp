@@ -26,13 +26,51 @@
 #include <dynarmic/interface/A32/coprocessor.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 
+#include <array>
+#include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
+
+static bool dynarmic_jit_lifetime_trace_enabled() {
+    static const bool enabled = [] {
+        const char *const value = std::getenv("VITA3K_DYNARMIC_JIT_TRACE");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+}
+
+static std::size_t dynarmic_host_thread_tag() {
+    return std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+
+static bool acxi_text_trace_enabled() {
+    static const bool enabled = [] {
+        const char *const value = std::getenv("VITA3K_ACXI_TEXT_TRACE");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+}
+
+static bool acxi_menu_exec_trace_enabled() {
+    static const bool enabled = [] {
+        const char *const value = std::getenv("VITA3K_ACXI_EXEC_TRACE");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+}
+
+static bool acxi_text_address(uint32_t address) {
+    return address >= 0x1000u && address < 0xFA000u;
+}
 
 class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
     uint32_t tpidruro;
+    uint32_t tpidrurw;
     uint32_t sctlr;
     uint32_t dacr;
 
@@ -41,6 +79,7 @@ public:
 
     explicit ArmDynarmicCP15()
         : tpidruro(0)
+        , tpidrurw(0)
         , sctlr(0)
         , dacr(0) {
     }
@@ -58,6 +97,11 @@ public:
         // MCR p15, 0, Rt, c13, c0, 3 — write TPIDRURO
         if (CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 3) {
             return &tpidruro;
+        }
+
+        // iOS user TLS uses TPIDRURW in addition to Vita's TPIDRURO.
+        if (CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 2) {
+            return &tpidrurw;
         }
 
         // MCR p15, 0, Rt, c1, c0, 0 — write SCTLR
@@ -83,6 +127,11 @@ public:
         // MRC p15, 0, Rt, c13, c0, 3 — read TPIDRURO (thread-local storage)
         if (CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 3) {
             return &tpidruro;
+        }
+
+        // iOS user TLS uses TPIDRURW in addition to Vita's TPIDRURO.
+        if (CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 2) {
+            return &tpidrurw;
         }
 
         // MRC p15, 0, Rt, c1, c0, 0 — read SCTLR
@@ -120,6 +169,14 @@ public:
     uint32_t get_tpidruro() const {
         return tpidruro;
     }
+
+    void set_tpidrurw(uint32_t tpidrurw) {
+        this->tpidrurw = tpidrurw;
+    }
+
+    uint32_t get_tpidrurw() const {
+        return tpidrurw;
+    }
 };
 
 class ArmDynarmicCallback : public Dynarmic::A32::UserCallbacks {
@@ -153,9 +210,83 @@ public:
         LOG_TRACE("{} ({}): {} {}", log_hex(self_), self.parent->thread_id, log_hex(address), disassembly);
     }
 
+    static uint32_t ReadAceWord(ArmDynarmicCallback &self, uint32_t address) {
+        const Ptr<uint32_t> ptr{ address };
+        return ptr && ptr.valid(*self.parent->mem) ? *ptr.get(*self.parent->mem) : 0;
+    }
+
+    static void TraceAceMenuExec(uint64_t self_, uint64_t address, uint64_t) {
+        ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
+        const uint32_t current = ReadAceWord(self, 0x00112F60u);
+        const uint32_t next = ReadAceWord(self, 0x00112F68u);
+        if (current != 12u && next != 12u)
+            return;
+
+        const uint32_t pc = static_cast<uint32_t>(address);
+        const uint32_t right = ReadAceWord(self, 0x0011303Cu);
+        const uint32_t r0 = self.cpu->get_reg(0);
+        unsigned slot = 0;
+        switch (pc) {
+        case 0x0008BB2Cu:
+            slot = 0;
+            break;
+        case 0x0007A074u:
+            slot = 1;
+            break;
+        case 0x00084F48u:
+            if (r0 != right)
+                return;
+            slot = 2;
+            break;
+        case 0x00079268u:
+            if (!right || r0 != right + 8u)
+                return;
+            slot = 3;
+            break;
+        case 0x0009F930u:
+            slot = 4;
+            break;
+        case 0x0009EC4Cu:
+            slot = 5;
+            break;
+        default:
+            return;
+        }
+
+        static std::array<std::atomic<uint32_t>, 6> counts{};
+        const uint32_t count = counts[slot].fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (count > 4u && (count & (count - 1u)) != 0u)
+            return;
+
+        const uint32_t task = ReadAceWord(self, 0x00112F5Cu);
+        LOG_INFO("ACXI_EXEC_TRACE pc={} count={} thread={} r0={} current={} next={} state={} right={} rb_start={} rb_end={} rb_frame={} rb_play={} rb_flags={} rb_total={}",
+            log_hex(pc), count, self.parent->thread_id, log_hex(r0), current, next,
+            task ? ReadAceWord(self, task + 108u) : 0u, log_hex(right),
+            right ? ReadAceWord(self, right + 36u) : 0u,
+            right ? ReadAceWord(self, right + 40u) : 0u,
+            right ? ReadAceWord(self, right + 44u) : 0u,
+            right ? ReadAceWord(self, right + 48u) : 0u,
+            right ? log_hex(ReadAceWord(self, right + 52u)) : log_hex(0u),
+            right ? ReadAceWord(self, right + 60u) : 0u);
+    }
+
     void PreCodeTranslationHook(bool is_thumb, Dynarmic::A32::VAddr pc, Dynarmic::A32::IREmitter &ir) override {
         if (cpu->log_code) {
             ir.CallHostFunction(&TraceInstruction, ir.Imm64((uint64_t)this), ir.Imm64(pc), ir.Imm64(is_thumb));
+        }
+        if (acxi_menu_exec_trace_enabled()) {
+            switch (pc) {
+            case 0x0008BB2Cu:
+            case 0x0007A074u:
+            case 0x00084F48u:
+            case 0x00079268u:
+            case 0x0009F930u:
+            case 0x0009EC4Cu:
+                ir.CallHostFunction(&TraceAceMenuExec, ir.Imm64((uint64_t)this), ir.Imm64(pc), ir.Imm64(is_thumb));
+                break;
+            default:
+                break;
+            }
         }
     }
 
@@ -210,7 +341,18 @@ public:
             return;
         }
 
-        *ptr.get(*parent->mem) = value;
+        T *const host = ptr.get(*parent->mem);
+        if (acxi_text_trace_enabled() && acxi_text_address(addr)) {
+            static std::atomic<uint32_t> count{ 0 };
+            const uint32_t index = count.fetch_add(1, std::memory_order_relaxed);
+            if (index < 128) {
+                LOG_ERROR("ACXI_TEXT_WRITE index={} thread={} bits={} addr=0x{:08X} old=0x{:X} new=0x{:X} pc=0x{:08X} lr=0x{:08X}",
+                    index, parent->thread_id, sizeof(T) * 8, addr,
+                    static_cast<uint64_t>(*host), static_cast<uint64_t>(value),
+                    cpu->get_pc(), cpu->get_reg(14));
+            }
+        }
+        *host = value;
         if (cpu->log_mem) {
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}", sizeof(T) * 8, addr, value);
         }
@@ -246,6 +388,16 @@ public:
             return false;
         }
 
+        if (acxi_text_trace_enabled() && acxi_text_address(addr)) {
+            static std::atomic<uint32_t> count{ 0 };
+            const uint32_t index = count.fetch_add(1, std::memory_order_relaxed);
+            if (index < 128) {
+                LOG_ERROR("ACXI_TEXT_EXCLUSIVE_WRITE index={} thread={} bits={} addr=0x{:08X} expected=0x{:X} new=0x{:X} pc=0x{:08X} lr=0x{:08X}",
+                    index, parent->thread_id, sizeof(T) * 8, addr,
+                    static_cast<uint64_t>(expected), static_cast<uint64_t>(value),
+                    cpu->get_pc(), cpu->get_reg(14));
+            }
+        }
         auto result = Ptr<T>(addr).atomic_compare_and_swap(*parent->mem, value, expected);
         if (cpu->log_mem) {
             LOG_TRACE("Write uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}", sizeof(T) * 8, addr, value, expected);
@@ -299,6 +451,15 @@ public:
         case Dynarmic::A32::Exception::Yield:
             break;
         case Dynarmic::A32::Exception::UndefinedInstruction:
+            if (acxi_text_trace_enabled()) {
+                const uint32_t call_pc = 0x6A2E0u;
+                const uint32_t call_word = MemoryRead32(call_pc);
+                int32_t displacement = static_cast<int32_t>((call_word & 0x00FFFFFFu) << 8) >> 6;
+                const uint32_t target = call_pc + 8u + static_cast<uint32_t>(displacement);
+                LOG_ERROR("ACXI_TEXT_SNAPSHOT fault=0x{:08X} lr=0x{:08X} call=0x{:08X} word=0x{:08X} decoded_target=0x{:08X} callee_word=0x{:08X} return_word=0x{:08X} literal_word=0x{:08X}",
+                    pc, cpu->get_reg(14), call_pc, call_word, target,
+                    MemoryRead32(0x1FCE8u), MemoryRead32(0x1FD18u), MemoryRead32(0x3E804u));
+            }
             LOG_WARN("Undefined instruction at address 0x{:X}, instruction 0x{:X} ({})", pc, MemoryReadCode(pc).value(), disassemble(*parent, pc, nullptr));
             InterpreterFallback(pc, 1);
             break;
@@ -323,10 +484,16 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {}
+    void AddTicks(uint64_t ticks) override {
+        if (ticks > parent->ticks_remaining) {
+            parent->ticks_remaining = 0;
+            return;
+        }
+        parent->ticks_remaining -= ticks;
+    }
 
     uint64_t GetTicksRemaining() override {
-        return 1ull << 60;
+        return parent->ticks_remaining;
     }
 };
 
@@ -347,9 +514,21 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
-    config.enable_cycle_counting = false;
+    config.enable_cycle_counting = true;
 
-    return std::make_unique<Dynarmic::A32::Jit>(config);
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_JIT_CREATE_BEGIN cpu={} guest_thread={} core={} cpu_opt={} use_page_table={} log_mem={} log_code={} page_table={} fastmem=0x{:X} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, core_id, cpu_opt,
+            parent->mem->use_page_table, log_mem, log_code, static_cast<const void *>(config.page_table),
+            config.fastmem_pointer.value_or(0), dynarmic_host_thread_tag());
+    }
+    auto created = std::make_unique<Dynarmic::A32::Jit>(config);
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_JIT_CREATE_END cpu={} guest_thread={} jit={} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, static_cast<const void *>(created.get()),
+            dynarmic_host_thread_tag());
+    }
+    return created;
 }
 
 DynarmicCPU::DynarmicCPU(CPUState *state, std::size_t processor_id, bool cpu_opt)
@@ -361,7 +540,13 @@ DynarmicCPU::DynarmicCPU(CPUState *state, std::size_t processor_id, bool cpu_opt
     jit = make_jit();
 }
 
-DynarmicCPU::~DynarmicCPU() = default;
+DynarmicCPU::~DynarmicCPU() {
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_DESTROY cpu={} guest_thread={} jit={} executing={} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, static_cast<const void *>(jit.get()),
+            jit && jit->IsExecuting(), dynarmic_host_thread_tag());
+    }
+}
 
 int DynarmicCPU::run() {
     halted = false;
@@ -394,16 +579,36 @@ void DynarmicCPU::set_log_code(bool log) {
     if (log_code == log)
         return;
 
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_SET_LOG_CODE_BEGIN cpu={} guest_thread={} old_jit={} old_executing={} old_value={} new_value={} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, static_cast<const void *>(jit.get()),
+            jit && jit->IsExecuting(), log_code, log, dynarmic_host_thread_tag());
+    }
     log_code = log;
     jit = make_jit();
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_SET_LOG_CODE_END cpu={} guest_thread={} new_jit={} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, static_cast<const void *>(jit.get()),
+            dynarmic_host_thread_tag());
+    }
 }
 
 void DynarmicCPU::set_log_mem(bool log) {
     if (log_mem == log)
         return;
 
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_SET_LOG_MEM_BEGIN cpu={} guest_thread={} old_jit={} old_executing={} old_value={} new_value={} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, static_cast<const void *>(jit.get()),
+            jit && jit->IsExecuting(), log_mem, log, dynarmic_host_thread_tag());
+    }
     log_mem = log;
     jit = make_jit();
+    if (dynarmic_jit_lifetime_trace_enabled()) {
+        LOG_INFO("DYNARMIC_CPU_SET_LOG_MEM_END cpu={} guest_thread={} new_jit={} host_thread=0x{:X}",
+            static_cast<const void *>(this), parent->thread_id, static_cast<const void *>(jit.get()),
+            dynarmic_host_thread_tag());
+    }
 }
 
 bool DynarmicCPU::get_log_code() {
@@ -444,6 +649,14 @@ uint32_t DynarmicCPU::get_tpidruro() {
 
 void DynarmicCPU::set_tpidruro(uint32_t val) {
     cp15->set_tpidruro(val);
+}
+
+uint32_t DynarmicCPU::get_tpidrurw() {
+    return cp15->get_tpidrurw();
+}
+
+void DynarmicCPU::set_tpidrurw(uint32_t val) {
+    cp15->set_tpidrurw(val);
 }
 
 void DynarmicCPU::set_pc(uint32_t val) {

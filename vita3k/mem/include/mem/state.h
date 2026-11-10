@@ -62,6 +62,11 @@ struct MemExternalMapping {
     uint32_t size;
 };
 
+struct MemAliasMapping {
+    Address backing;
+    uint32_t size;
+};
+
 struct MemState {
     std::mutex generation_mutex;
     std::mutex protect_mutex;
@@ -77,4 +82,5 @@ struct MemState {
     bool use_page_table = false;
     PageTable page_table;
     std::map<uint64_t, MemExternalMapping, std::greater<>> external_mapping;
+    std::map<Address, MemAliasMapping> alias_mapping;
 };

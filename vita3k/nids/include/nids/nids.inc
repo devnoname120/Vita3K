@@ -7758,3 +7758,14 @@ NID(sceWlanUnregisterCallback, 0x826DC04F)
 NID(kuKernelAllocMemBlock, 0x2EF7C290)
 NID(kuKernelFlushCaches, 0x38B70744)
 NID(kuKernelCpuUnrestrictedMemcpy, 0x91D9CABC)
+
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+// Module "ttbr_remap": emulator bridge for the unchanged kernel plugin ABI.
+NID(ttbr_remap_create, 0xA2BC0C64)
+NID(ttbr_remap_map, 0x3C40DD70)
+NID(ttbr_remap_edit, 0x50CBA595)
+NID(ttbr_remap_run, 0x65B7A1A6)
+NID(ttbr_remap_destroy, 0xB555C0AC)
+NID(ttbr_remap_debug_state, 0x8D2C0DE2)
+NID(ttbr_remap_version, 0x3EDF3E1E)
+#endif

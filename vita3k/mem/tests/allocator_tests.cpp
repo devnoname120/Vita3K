@@ -15,8 +15,11 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <cstring>
 #include <list>
 #include <mem/allocator.h>
+#include <mem/functions.h>
+#include <mem/ptr.h>
 #include <mem/util.h>
 
 #include <gtest/gtest.h>
@@ -38,6 +41,149 @@ TEST(guest_memory, fixed_low_pages_do_not_inherit_host_null_reservation) {
     EXPECT_EQ(state.memory[0x2000], 0x52);
     free(state, 0x1000);
     free(state, 0x2000);
+}
+
+TEST(guest_memory, alias_mapping_preserves_backing_and_stays_coherent) {
+    MemState state;
+    ASSERT_TRUE(init(state, true));
+    const Address backing = alloc_at(state, 0x80000000, 0x2000, "alias-backing");
+    ASSERT_EQ(backing, 0x80000000u);
+    auto *backing_ptr = Ptr<uint8_t>(backing).get(state);
+    backing_ptr[0] = 0x31;
+    backing_ptr[0x1000] = 0x52;
+
+    ASSERT_TRUE(add_alias_mapping(state, 0x4000, backing, 0x2000));
+    auto *alias_ptr = Ptr<uint8_t>(0x4000).get(state);
+    EXPECT_EQ(alias_ptr[0], 0x31);
+    EXPECT_EQ(alias_ptr[0x1000], 0x52);
+    alias_ptr[7] = 0xA4;
+    EXPECT_EQ(backing_ptr[7], 0xA4);
+
+    ASSERT_TRUE(remove_alias_mapping(state, 0x4000, 0x2000));
+    EXPECT_FALSE(is_valid_addr(state, 0x4000));
+    EXPECT_EQ(backing_ptr[0], 0x31);
+    EXPECT_EQ(backing_ptr[7], 0xA4);
+    free(state, backing);
+    deinit_mem(state);
+}
+
+TEST(guest_memory, finds_backing_allocation_from_interior_address) {
+    MemState state;
+    ASSERT_TRUE(init(state, true));
+    const Address allocation = alloc_at(state, 0x81000000, 0x2800, "allocation-range");
+    ASSERT_EQ(allocation, 0x81000000u);
+
+    Address base = 0;
+    uint32_t size = 0;
+    ASSERT_TRUE(find_backing_allocation_range(state, allocation + 0x1800, base, size));
+    EXPECT_EQ(base, allocation);
+    EXPECT_EQ(size, 0x3000u);
+    EXPECT_FALSE(find_backing_allocation_range(state, allocation + 0x3000, base, size));
+
+    free(state, allocation);
+    EXPECT_FALSE(find_backing_allocation_range(state, allocation + 0x1800, base, size));
+    deinit_mem(state);
+}
+
+TEST(guest_memory, excludes_aliases_from_backing_allocation_lookup) {
+    MemState state;
+    ASSERT_TRUE(init(state, true));
+    const Address backing = alloc_at(state, 0x80000000, 0x2000, "alias-backing-range");
+    ASSERT_EQ(backing, 0x80000000u);
+    ASSERT_TRUE(add_alias_mapping(state, 0x4000, backing, 0x2000));
+
+    Address base = 0;
+    uint32_t size = 0;
+    EXPECT_TRUE(find_backing_allocation_range(state, backing + 0x1000, base, size));
+    EXPECT_EQ(base, backing);
+    EXPECT_EQ(size, 0x2000u);
+    EXPECT_FALSE(find_backing_allocation_range(state, 0x5000, base, size));
+
+    ASSERT_TRUE(remove_alias_mapping(state, 0x4000, 0x2000));
+    free(state, backing);
+    deinit_mem(state);
+}
+
+TEST(guest_memory, limits_contiguous_span_at_translation_boundaries) {
+    MemState state;
+    ASSERT_TRUE(init(state, true));
+
+    const Address regular = alloc_at(state, 0x81000000, 0x4000, "regular-span");
+    ASSERT_EQ(regular, 0x81000000u);
+    EXPECT_EQ(mapped_contiguous_size(state, regular + 0xFF0, 0x2020), 0x2020u);
+
+    const Address first_backing = alloc_at(state, 0x80000000, 0x1000, "first-backing");
+    const Address second_backing = alloc_at(state, 0x80002000, 0x1000, "second-backing");
+    ASSERT_EQ(first_backing, 0x80000000u);
+    ASSERT_EQ(second_backing, 0x80002000u);
+    ASSERT_TRUE(add_alias_mapping(state, 0x4000, first_backing, 0x1000));
+    ASSERT_TRUE(add_alias_mapping(state, 0x5000, second_backing, 0x1000));
+
+    EXPECT_EQ(mapped_contiguous_size(state, 0x4FF0, 0x30), 0x10u);
+    EXPECT_EQ(mapped_contiguous_size(state, 0x5000, 0x30), 0x30u);
+    EXPECT_EQ(mapped_contiguous_size(state, 0x6000, 0x30), 0u);
+    EXPECT_EQ(mapped_contiguous_size(state, 0xFFFFFFF0, 0x30), 0u);
+
+    ASSERT_TRUE(remove_alias_mapping(state, 0x4000, 0x1000));
+    ASSERT_TRUE(remove_alias_mapping(state, 0x5000, 0x1000));
+    free(state, first_backing);
+    free(state, second_backing);
+    free(state, regular);
+    deinit_mem(state);
+}
+
+TEST(guest_memory, copies_across_noncontiguous_page_translations) {
+    MemState state;
+    ASSERT_TRUE(init(state, true));
+
+    const Address source_first = alloc_at(state, 0x80000000, 0x1000, "copy-source-first");
+    const Address source_second = alloc_at(state, 0x80002000, 0x1000, "copy-source-second");
+    const Address destination_first = alloc_at(state, 0x80004000, 0x1000, "copy-destination-first");
+    const Address destination_second = alloc_at(state, 0x80006000, 0x1000, "copy-destination-second");
+    ASSERT_EQ(source_first, 0x80000000u);
+    ASSERT_EQ(source_second, 0x80002000u);
+    ASSERT_EQ(destination_first, 0x80004000u);
+    ASSERT_EQ(destination_second, 0x80006000u);
+
+    ASSERT_TRUE(add_alias_mapping(state, 0x4000, source_first, 0x1000));
+    ASSERT_TRUE(add_alias_mapping(state, 0x5000, source_second, 0x1000));
+    ASSERT_TRUE(add_alias_mapping(state, 0x6000, destination_first, 0x1000));
+    ASSERT_TRUE(add_alias_mapping(state, 0x7000, destination_second, 0x1000));
+
+    auto *source_first_ptr = Ptr<uint8_t>(source_first).get(state);
+    auto *source_second_ptr = Ptr<uint8_t>(source_second).get(state);
+    auto *destination_first_ptr = Ptr<uint8_t>(destination_first).get(state);
+    auto *destination_second_ptr = Ptr<uint8_t>(destination_second).get(state);
+    for (uint32_t index = 0; index < 8; ++index)
+        source_first_ptr[0xFF8 + index] = static_cast<uint8_t>(0x20 + index);
+    for (uint32_t index = 0; index < 24; ++index)
+        source_second_ptr[index] = static_cast<uint8_t>(0x28 + index);
+    std::memset(destination_first_ptr + 0xFF8, 0xA5, 8);
+    std::memset(destination_second_ptr, 0xA5, 24);
+
+    ASSERT_TRUE(copy_guest_memory(state, 0x6FF8, 0x4FF8, 32));
+    for (uint32_t index = 0; index < 8; ++index)
+        EXPECT_EQ(destination_first_ptr[0xFF8 + index], static_cast<uint8_t>(0x20 + index));
+    for (uint32_t index = 0; index < 24; ++index)
+        EXPECT_EQ(destination_second_ptr[index], static_cast<uint8_t>(0x28 + index));
+
+    std::memset(destination_first_ptr + 0xFF8, 0x5A, 8);
+    std::memset(destination_second_ptr, 0x5A, 24);
+    EXPECT_FALSE(copy_guest_memory(state, 0x6FF8, 0x8FF8, 32));
+    for (uint32_t index = 0; index < 8; ++index)
+        EXPECT_EQ(destination_first_ptr[0xFF8 + index], 0x5A);
+    for (uint32_t index = 0; index < 24; ++index)
+        EXPECT_EQ(destination_second_ptr[index], 0x5A);
+
+    ASSERT_TRUE(remove_alias_mapping(state, 0x4000, 0x1000));
+    ASSERT_TRUE(remove_alias_mapping(state, 0x5000, 0x1000));
+    ASSERT_TRUE(remove_alias_mapping(state, 0x6000, 0x1000));
+    ASSERT_TRUE(remove_alias_mapping(state, 0x7000, 0x1000));
+    free(state, source_first);
+    free(state, source_second);
+    free(state, destination_first);
+    free(state, destination_second);
+    deinit_mem(state);
 }
 
 TEST(bitmap_allocator, one_bit_allocation) {

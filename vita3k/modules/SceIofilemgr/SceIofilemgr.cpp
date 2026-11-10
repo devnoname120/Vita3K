@@ -17,7 +17,9 @@
 
 #include "SceIofilemgr.h"
 
+#include <cpu/functions.h>
 #include <io/functions.h>
+#include <kernel/state.h>
 #include <kernel/types.h>
 
 #include <util/tracy.h>
@@ -270,9 +272,37 @@ EXPORT(int, sceIoLseek32, const SceUID fd, const int32_t offset, const SceIoSeek
     return static_cast<int>(seek_file(fd, offset, whence, emuenv.io, export_name));
 }
 
-EXPORT(int, sceIoRead, const SceUID fd, void *data, const SceSize size) {
+EXPORT(int, sceIoRead, const SceUID fd, Ptr<void> data, const SceSize size) {
     TRACY_FUNC(sceIoRead, fd, data, size);
-    return read_file(data, emuenv.io, fd, size, export_name);
+    if (emuenv.io.title_id == "ACXI00001" && (!data || (size & 0x80000000u))) {
+        const auto thread = emuenv.kernel.get_thread(thread_id);
+        const CPUContext context = thread ? save_context(*thread->cpu) : CPUContext{};
+        const auto file = emuenv.io.std_files.find(fd);
+        const char *const path = file != emuenv.io.std_files.end()
+            ? file->second.get_vita_loc()
+            : "<unknown>";
+        LOG_ERROR("ACXI_INVALID_IO_READ thid=0x{:08X} fd=0x{:08X} path={} data={} size=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+            thread_id, fd, path, data.address(), size,
+            context.cpu_registers[0], context.cpu_registers[1],
+            context.cpu_registers[2], context.cpu_registers[3],
+            context.get_pc(), context.get_lr(), context.get_sp());
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    }
+    if (emuenv.io.title_id == "DDRG00001" && (!data || (size & 0x80000000u))) {
+        const auto thread = emuenv.kernel.get_thread(thread_id);
+        const CPUContext context = thread ? save_context(*thread->cpu) : CPUContext{};
+        const auto file = emuenv.io.std_files.find(fd);
+        const char *const path = file != emuenv.io.std_files.end()
+            ? file->second.get_vita_loc()
+            : "<unknown>";
+        LOG_ERROR("DDRG_INVALID_IO_READ thid=0x{:08X} fd=0x{:08X} path={} data={} size=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+            thread_id, fd, path, data.address(), size,
+            context.cpu_registers[0], context.cpu_registers[1],
+            context.cpu_registers[2], context.cpu_registers[3],
+            context.get_pc(), context.get_lr(), context.get_sp());
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    }
+    return read_guest_file(data, emuenv.mem, emuenv.io, fd, size, export_name);
 }
 
 EXPORT(int, sceIoReadAsync) {
@@ -315,9 +345,9 @@ EXPORT(int, sceIoSyncByFdAsync) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceIoWrite, const SceUID fd, const void *data, const SceSize size) {
+EXPORT(int, sceIoWrite, const SceUID fd, Ptr<const void> data, const SceSize size) {
     TRACY_FUNC(sceIoWrite, fd, data, size);
-    return write_file(fd, data, size, emuenv.io, export_name);
+    return write_guest_file(fd, data, emuenv.mem, size, emuenv.io, export_name);
 }
 
 EXPORT(int, sceIoWriteAsync) {

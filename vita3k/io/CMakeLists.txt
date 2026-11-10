@@ -17,4 +17,15 @@ add_library(
 )
 
 target_include_directories(io PUBLIC include)
-target_link_libraries(io PUBLIC dirent rtc util)
+target_link_libraries(io PUBLIC dirent rtc util mem)
+
+if(NOT ANDROID)
+	add_executable(
+		io-tests
+		tests/guest_buffer_tests.cpp
+	)
+
+	target_include_directories(io-tests PRIVATE include)
+	target_link_libraries(io-tests PRIVATE io mem googletest util)
+	add_test(NAME io COMMAND io-tests)
+endif()

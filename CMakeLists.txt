@@ -52,6 +52,11 @@ else()
 endif()
 
 option(FORCE_BUILD_OPENSSL_MAC OFF)
+option(VITA3K_ENABLE_TTBR_REMAP_HLE "Enable the ttbr_remap plugin ABI bridge" OFF)
+
+if(VITA3K_ENABLE_TTBR_REMAP_HLE)
+    add_compile_definitions(VITA3K_ENABLE_TTBR_REMAP_HLE=1)
+endif()
 
 if("${CMAKE_CXX_COMPILER_LAUNCHER}" STREQUAL "")
 	find_program(CCACHE_PROGRAM ccache)

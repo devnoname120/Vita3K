@@ -29,7 +29,11 @@
 
 #include <string>
 
+template <class T>
+class Ptr;
+
 struct IOState;
+struct MemState;
 
 inline SceUID invalid_fd = -1;
 
@@ -59,7 +63,9 @@ bool copy_path(const fs::path &src_path, const fs::path &vita_fs_path, const std
 
 SceUID open_file(IOState &io, const char *path, const int flags, const fs::path &vita_fs_path, const char *export_name);
 int read_file(void *data, IOState &io, SceUID fd, SceSize size, const char *export_name);
+int read_guest_file(Ptr<void> data, MemState &mem, IOState &io, SceUID fd, SceSize size, const char *export_name);
 int write_file(SceUID fd, const void *data, SceSize size, const IOState &io, const char *export_name);
+int write_guest_file(SceUID fd, Ptr<const void> data, const MemState &mem, SceSize size, const IOState &io, const char *export_name);
 int truncate_file(SceUID fd, unsigned long long length, const IOState &io, const char *export_name);
 SceOff seek_file(SceUID fd, SceOff offset, SceIoSeekMode whence, IOState &io, const char *export_name);
 SceOff tell_file(IOState &io, const SceUID fd, const char *export_name);

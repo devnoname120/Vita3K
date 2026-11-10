@@ -57,6 +57,8 @@ struct ThreadParams {
     SDL_Semaphore *host_may_destroy_params = nullptr;
 };
 
+static constexpr Sint64 TTBR_REMAP_HOST_THREAD_STACK_SIZE = 8 * 1024 * 1024;
+
 static int SDLCALL thread_function(void *data) {
     assert(data != nullptr);
     const ThreadParams params = *static_cast<const ThreadParams *>(data);
@@ -176,7 +178,28 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     params.thid = thread->id;
 
     params.host_may_destroy_params = SDL_CreateSemaphore(0);
-    SDL_DetachThread(SDL_CreateThread(&thread_function, thread->name.c_str(), &params));
+    SDL_Thread *host_thread = nullptr;
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    const char *ttbr_hle_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+    if (ttbr_hle_title && *ttbr_hle_title) {
+        // Nested TTBR execution and Apple unwind lookup can exceed macOS's
+        // 512 KiB SDL default while loading large guest scenes.
+        const SDL_PropertiesID properties = SDL_CreateProperties();
+        if (properties) {
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,
+                reinterpret_cast<void *>(&thread_function));
+            SDL_SetStringProperty(properties, SDL_PROP_THREAD_CREATE_NAME_STRING, thread->name.c_str());
+            SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, &params);
+            SDL_SetNumberProperty(properties, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER,
+                TTBR_REMAP_HOST_THREAD_STACK_SIZE);
+            host_thread = SDL_CreateThreadWithProperties(properties);
+            SDL_DestroyProperties(properties);
+        }
+    }
+#endif
+    if (!host_thread)
+        host_thread = SDL_CreateThread(&thread_function, thread->name.c_str(), &params);
+    SDL_DetachThread(host_thread);
     SDL_WaitSemaphore(params.host_may_destroy_params);
     SDL_DestroySemaphore(params.host_may_destroy_params);
 

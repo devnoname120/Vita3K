@@ -37,6 +37,7 @@ typedef std::unique_ptr<CPUState, std::function<void(CPUState *)>> CPUStatePtr;
 typedef std::unique_ptr<CPUInterface> CPUInterfacePtr;
 
 inline constexpr std::size_t MAX_CORE_COUNT = 150;
+inline constexpr uint64_t CPU_RUN_UNBOUNDED_TICKS = 1ull << 60;
 
 struct CPUContext {
     CPUContext() = default;
@@ -96,6 +97,24 @@ struct CPUContext {
         fmt::format_to(back_it, "Thumb: {}\n", thumb());
         return str;
     }
+};
+
+enum class CPUContextRunReason {
+    Halt,
+    Svc,
+    Abort,
+    Error,
+};
+
+struct CPUContextRunResult {
+    CPUContext context;
+    CPUContextRunReason reason = CPUContextRunReason::Error;
+    uint32_t tpidruro = 0;
+    uint32_t tpidrurw = 0;
+    uint32_t svc = 0;
+    uint32_t fault_address = 0;
+    bool fault_is_write = false;
+    int cpu_result = 0;
 };
 
 union DoubleReg {

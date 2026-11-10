@@ -117,6 +117,7 @@ struct ThreadState {
 
     void suspend();
     void resume(bool step = false);
+    bool can_resume_nested_run();
     std::string log_stack_traceback() const;
 
 private:

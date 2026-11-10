@@ -108,6 +108,10 @@ uint32_t read_tpidruro(CPUState &state) {
     return state.cpu->get_tpidruro();
 }
 
+uint32_t read_tpidrurw(CPUState &state) {
+    return state.cpu->get_tpidrurw();
+}
+
 void write_reg(CPUState &state, size_t index, uint32_t value) {
     state.cpu->set_reg(index, value);
 }
@@ -126,6 +130,10 @@ void write_lr(CPUState &state, uint32_t value) {
 
 void write_tpidruro(CPUState &state, uint32_t value) {
     state.cpu->set_tpidruro(value);
+}
+
+void write_tpidrurw(CPUState &state, uint32_t value) {
+    state.cpu->set_tpidrurw(value);
 }
 
 bool is_thumb_mode(CPUState &state) {
@@ -186,6 +194,64 @@ CPUContext save_context(CPUState &state) {
 
 void load_context(CPUState &state, const CPUContext &ctx) {
     state.cpu->load_context(ctx);
+}
+
+CPUContextRunResult run_context_until_trap(CPUState &state, const CPUContext &context,
+    uint32_t tpidruro, uint32_t tpidrurw) {
+    return run_context_until_trap(state, context, tpidruro, tpidrurw,
+        CPU_RUN_UNBOUNDED_TICKS);
+}
+
+CPUContextRunResult run_context_until_trap(CPUState &state, const CPUContext &context,
+    uint32_t tpidruro, uint32_t tpidrurw, uint64_t tick_budget) {
+    const CPUContext caller_context = save_context(state);
+    const uint32_t caller_tpidruro = read_tpidruro(state);
+    const uint32_t caller_tpidrurw = read_tpidrurw(state);
+    const bool caller_svc_called = state.svc_called;
+    const uint32_t caller_svc = state.svc;
+    const bool caller_abort_pending = state.abort_pending.exchange(false);
+    const uint32_t caller_abort_fault_addr = state.abort_fault_addr.load();
+    const bool caller_abort_is_write = state.abort_is_write.load();
+    const uint64_t caller_ticks_remaining = state.ticks_remaining;
+
+    load_context(state, context);
+    write_tpidruro(state, tpidruro);
+    write_tpidrurw(state, tpidrurw);
+    state.svc_called = false;
+    state.svc = 0;
+    state.abort_fault_addr.store(0);
+    state.abort_is_write.store(false);
+    state.ticks_remaining = tick_budget;
+
+    CPUContextRunResult result;
+    result.cpu_result = run(state);
+    result.context = save_context(state);
+    result.tpidruro = read_tpidruro(state);
+    result.tpidrurw = read_tpidrurw(state);
+    result.svc = state.svc;
+    result.fault_address = state.abort_fault_addr.load();
+    result.fault_is_write = state.abort_is_write.load();
+
+    if (state.abort_pending.exchange(false)) {
+        result.reason = CPUContextRunReason::Abort;
+    } else if (state.svc_called) {
+        result.reason = CPUContextRunReason::Svc;
+    } else if (result.cpu_result > 0) {
+        result.reason = CPUContextRunReason::Halt;
+    } else {
+        result.reason = CPUContextRunReason::Error;
+    }
+
+    load_context(state, caller_context);
+    write_tpidruro(state, caller_tpidruro);
+    write_tpidrurw(state, caller_tpidrurw);
+    state.svc_called = caller_svc_called;
+    state.svc = caller_svc;
+    state.abort_fault_addr.store(caller_abort_fault_addr);
+    state.abort_is_write.store(caller_abort_is_write);
+    state.abort_pending.store(caller_abort_pending);
+    state.ticks_remaining = caller_ticks_remaining;
+    return result;
 }
 
 uint32_t stack_alloc(CPUState &state, size_t size) {

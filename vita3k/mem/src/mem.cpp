@@ -16,13 +16,16 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <mem/functions.h>
+#include <mem/ptr.h>
 #include <mem/state.h>
 
 #include <util/align.h>
 #include <util/log.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -32,6 +35,9 @@
 #include <Windows.h>
 #else
 #include <csignal>
+#ifdef __APPLE__
+#include <dlfcn.h>
+#endif
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -47,6 +53,9 @@ constexpr bool PAGE_NAME_TRACKING = true;
 
 // TODO: support multiple handlers
 static AccessViolationHandler access_violation_handler;
+static Address protect_trace_page;
+static std::atomic<uint32_t> protect_trace_add_count;
+static std::atomic<uint32_t> protect_trace_fault_count;
 static void register_access_violation_handler(const AccessViolationHandler &handler);
 
 static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_count, const char *name, const bool force);
@@ -63,6 +72,17 @@ static std::string get_error_msg() {
 #endif
 
 bool init(MemState &state, const bool use_page_table) {
+    protect_trace_page = 0;
+    protect_trace_add_count.store(0, std::memory_order_relaxed);
+    protect_trace_fault_count.store(0, std::memory_order_relaxed);
+    if (const char *value = std::getenv("VITA3K_PROTECT_TRACE_ADDRESS")) {
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        if (end != value && *end == '\0' && parsed <= UINT32_MAX) {
+            protect_trace_page = static_cast<Address>(parsed) & ~(STANDARD_PAGE_SIZE - 1);
+            fmt::print(stderr, "VITA3K_PROTECT_TRACE_ENABLED page=0x{:08X}\n", protect_trace_page);
+        }
+    }
 #ifdef _WIN32
     SYSTEM_INFO system_info = {};
     GetSystemInfo(&system_info);
@@ -153,6 +173,112 @@ bool is_valid_addr_range(const MemState &state, Address start, Address end) {
     const uint32_t start_page = start / STANDARD_PAGE_SIZE;
     const uint32_t end_page = (end + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
     return state.allocator.free_slot_count(start_page, end_page) == 0;
+}
+
+uint32_t mapped_contiguous_size(const MemState &state, Address address, uint32_t max_size) {
+    if (!address || !max_size || uint64_t(address) + max_size > 0x100000000ull)
+        return 0;
+
+    const uint32_t first_page = address / STANDARD_PAGE_SIZE;
+    if (first_page >= state.allocator.max_offset ||
+        state.allocator.free_slot_count(first_page, first_page + 1) != 0) {
+        return 0;
+    }
+
+    const uint8_t *const translation = state.use_page_table
+        ? state.page_table[first_page]
+        : state.memory.get();
+    const uint64_t requested_end = uint64_t(address) + max_size;
+    uint64_t span_end = std::min<uint64_t>(requested_end,
+        (uint64_t(first_page) + 1) * STANDARD_PAGE_SIZE);
+
+    for (uint32_t page = first_page + 1;
+         span_end < requested_end && page < state.allocator.max_offset;
+         ++page) {
+        if (state.allocator.free_slot_count(page, page + 1) != 0)
+            break;
+        const uint8_t *const next_translation = state.use_page_table
+            ? state.page_table[page]
+            : state.memory.get();
+        if (next_translation != translation)
+            break;
+        span_end = std::min<uint64_t>(requested_end,
+            (uint64_t(page) + 1) * STANDARD_PAGE_SIZE);
+    }
+
+    return static_cast<uint32_t>(span_end - address);
+}
+
+bool copy_guest_memory(MemState &state, Address destination, Address source, uint32_t size) {
+    if (!size)
+        return true;
+
+    const auto valid_range = [&](Address address) {
+        uint64_t current = address;
+        uint32_t remaining = size;
+        while (remaining) {
+            const uint32_t span = mapped_contiguous_size(state, static_cast<Address>(current), remaining);
+            if (!span)
+                return false;
+            current += span;
+            remaining -= span;
+        }
+        return true;
+    };
+    if (!valid_range(destination) || !valid_range(source))
+        return false;
+    if (destination == source)
+        return true;
+
+    uint64_t current_destination = destination;
+    uint64_t current_source = source;
+    uint32_t remaining = size;
+    while (remaining) {
+        const uint32_t destination_span = mapped_contiguous_size(
+            state, static_cast<Address>(current_destination), remaining);
+        const uint32_t source_span = mapped_contiguous_size(
+            state, static_cast<Address>(current_source), remaining);
+        const uint32_t chunk = std::min(destination_span, source_span);
+        std::memcpy(
+            Ptr<uint8_t>(static_cast<Address>(current_destination)).get(state),
+            Ptr<const uint8_t>(static_cast<Address>(current_source)).get(state),
+            chunk);
+        current_destination += chunk;
+        current_source += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+bool find_backing_allocation_range(MemState &state, Address address, Address &base, uint32_t &size) {
+    const std::lock_guard<std::mutex> lock(state.generation_mutex);
+
+    for (const auto &[alias, mapping] : state.alias_mapping) {
+        const uint64_t alias_end = uint64_t(alias) + mapping.size;
+        if (alias <= address && uint64_t(address) < alias_end)
+            return false;
+    }
+
+    const uint32_t page_num = address / STANDARD_PAGE_SIZE;
+    if (!address || !state.alloc_table || page_num >= state.allocator.max_offset ||
+        state.allocator.free_slot_count(page_num, page_num + 1) != 0) {
+        return false;
+    }
+
+    uint32_t first_page = page_num;
+    while (!state.alloc_table[first_page].allocated) {
+        if (first_page == 0)
+            return false;
+        --first_page;
+    }
+
+    const AllocMemPage &allocation = state.alloc_table[first_page];
+    if (!allocation.size || uint64_t(page_num) >= uint64_t(first_page) + allocation.size)
+        return false;
+
+    base = first_page * STANDARD_PAGE_SIZE;
+    size = allocation.size * STANDARD_PAGE_SIZE;
+    return true;
 }
 
 static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_count, const char *name, const bool force) {
@@ -300,7 +426,15 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     }
 
     auto it = state.protect_tree.lower_bound(vaddr);
+    const bool trace_fault = protect_trace_page &&
+        (vaddr & ~(STANDARD_PAGE_SIZE - 1)) == protect_trace_page &&
+        protect_trace_fault_count.fetch_add(1, std::memory_order_relaxed) < 16;
     if (it == state.protect_tree.end()) {
+        if (trace_fault) {
+            fmt::print(stderr,
+                "VITA3K_PROTECT_FAULT vaddr=0x{:08X} write={} owner=none reason=end\n",
+                vaddr, write);
+        }
         // HACK: keep going
         unprotect_inner(state, align_down(vaddr, state.host_page_size), state.host_page_size);
         LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X}", vaddr);
@@ -309,6 +443,11 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
 
     ProtectSegmentInfo &info = it->second;
     if (vaddr < it->first || vaddr >= it->first + info.size) {
+        if (trace_fault) {
+            fmt::print(stderr,
+                "VITA3K_PROTECT_FAULT vaddr=0x{:08X} write={} owner=none candidate=0x{:08X}+0x{:X}\n",
+                vaddr, write, it->first, info.size);
+        }
         // HACK: keep going
         unprotect_inner(state, align_down(vaddr, state.host_page_size), state.host_page_size);
         LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X}", vaddr);
@@ -316,6 +455,19 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     }
 
     Address previous_beg = it->first;
+    if (trace_fault) {
+        fmt::print(stderr,
+            "VITA3K_PROTECT_FAULT vaddr=0x{:08X} write={} segment=0x{:08X}+0x{:X} perm={} blocks={}\n",
+            vaddr, write, it->first, info.size, static_cast<int>(info.perm), info.blocks.size());
+        unsigned index = 0;
+        for (const auto &[block_addr, block] : info.blocks) {
+            if (index++ == 8)
+                break;
+            fmt::print(stderr,
+                "VITA3K_PROTECT_BLOCK index={} address=0x{:08X} size=0x{:X}\n",
+                index - 1, block_addr, block.size);
+        }
+    }
     for (auto &[block_addr, block] : info.blocks) {
         block.callback(vaddr, write);
     }
@@ -327,6 +479,9 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
 }
 
 bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
+    const Address requested_addr = addr;
+    const uint32_t requested_size = size;
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     ProtectSegmentInfo protect(size, perm);
     align_to_page(state, addr, protect.size);
@@ -359,6 +514,21 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
 
         // protect tree is in reverse order, so decrease it
         state.protect_tree.erase(it--);
+    }
+
+    if (protect_trace_page &&
+        static_cast<uint64_t>(requested_addr) < static_cast<uint64_t>(protect_trace_page) + STANDARD_PAGE_SIZE &&
+        static_cast<uint64_t>(protect_trace_page) < static_cast<uint64_t>(requested_addr) + requested_size &&
+        protect_trace_add_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+        const char *symbol = "";
+#ifdef __APPLE__
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void *>(caller), &info) && info.dli_sname)
+            symbol = info.dli_sname;
+#endif
+        fmt::print(stderr,
+            "VITA3K_PROTECT_ADD request=0x{:08X}+0x{:X} segment=0x{:08X}+0x{:X} perm={} caller=0x{:016X} symbol={} blocks={}\n",
+            requested_addr, requested_size, addr, protect.size, static_cast<int>(protect.perm), caller, symbol, protect.blocks.size());
     }
 
     protect_inner(state, addr, protect.size, protect.perm);
@@ -452,6 +622,45 @@ void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
             mem.page_table[mapping.address / KiB(4) + block] = mem.memory.get();
         }
     }
+}
+
+
+bool add_alias_mapping(MemState &mem, Address guest, Address backing, uint32_t size) {
+    if (!mem.use_page_table || !size || (guest & (STANDARD_PAGE_SIZE - 1)) ||
+        (backing & (STANDARD_PAGE_SIZE - 1)) || (size & (STANDARD_PAGE_SIZE - 1)) ||
+        guest > UINT32_MAX - size || backing > UINT32_MAX - size || guest == backing ||
+        (guest < backing + size && backing < guest + size) ||
+        !is_valid_addr_range(mem, backing, backing + size) || mem.alias_mapping.contains(guest)) {
+        return false;
+    }
+
+    if (try_alloc_at(mem, guest, size, "guest-alias") != guest) {
+        return false;
+    }
+
+    for (uint32_t offset = 0; offset < size; offset += STANDARD_PAGE_SIZE) {
+        const Address guest_page = guest + offset;
+        const Address backing_page = backing + offset;
+        auto *const backing_ptr = Ptr<uint8_t>(backing_page).get(mem);
+        mem.page_table[guest_page / STANDARD_PAGE_SIZE] =
+            reinterpret_cast<uint8_t *>(reinterpret_cast<uintptr_t>(backing_ptr) - guest_page);
+    }
+    mem.alias_mapping.emplace(guest, MemAliasMapping{ backing, size });
+    return true;
+}
+
+bool remove_alias_mapping(MemState &mem, Address guest, uint32_t size) {
+    const auto mapping = mem.alias_mapping.find(guest);
+    if (!mem.use_page_table || mapping == mem.alias_mapping.end() || mapping->second.size != size) {
+        return false;
+    }
+
+    for (uint32_t offset = 0; offset < size; offset += STANDARD_PAGE_SIZE) {
+        mem.page_table[(guest + offset) / STANDARD_PAGE_SIZE] = mem.memory.get();
+    }
+    mem.alias_mapping.erase(mapping);
+    free(mem, guest);
+    return true;
 }
 
 Address alloc(MemState &state, uint32_t size, const char *name, Address start_addr) {
@@ -571,6 +780,7 @@ void deinit_mem(MemState &state) {
     state.page_name_map.clear();
     state.page_table.reset();
     state.external_mapping.clear();
+    state.alias_mapping.clear();
     state.use_page_table = false;
     state.host_page_size = 0;
 }
