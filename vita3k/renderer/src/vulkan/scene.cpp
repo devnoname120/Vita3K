@@ -48,15 +48,6 @@ static bool doubledragon_viewport_trace_enabled() {
     return value && value[0] == '1' && value[1] == 0;
 }
 
-static bool bloonstd5hd_retry_first_textured_draw() {
-#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
-    const char *const title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
-    return title && std::strcmp(title, "BIOS00001") == 0;
-#else
-    return false;
-#endif
-}
-
 static bool acxi_skip_hangar_environment_draw(const VKContext &context, const MemState &mem, const Config &config) {
     if (config.run_app_path != "ACXI00001")
         return false;
@@ -699,6 +690,20 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
 
 void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format,
     Ptr<void> indices, size_t count, uint32_t instance_count, MemState &mem, const Config &config) {
+    // The uniform ring slots of a draw are sized for its own programs. Release
+    // them on every exit, including the early returns for a dropped mask-update
+    // draw or a pipeline still compiling: otherwise the next draw writes its
+    // uniforms into the smaller slot and the draw after it overwrites them.
+    // VitaGL issues a mask-update draw for every scissor change and at the
+    // start of each scene, so the first draw after one rendered with corrupted
+    // uniforms (the missing first glyph or panel of a scissored region).
+    struct UniformStorageRelease {
+        VKContext &context;
+        ~UniformStorageRelease() {
+            context.vertex_uniform_storage_allocated = false;
+            context.fragment_uniform_storage_allocated = false;
+        }
+    } uniform_storage_release{ context };
     const auto &mg2_vertex_renderer = context.record.vertex_program.get(mem)->renderer_data;
     const auto &mg2_fragment_renderer = context.record.fragment_program.get(mem)->renderer_data;
     static uint32_t mg2_clear_trace_count = 0;
@@ -928,14 +933,6 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     }
 
     // create, update and bind descriptors (uniforms and textures)
-    const uint16_t fragment_texture_count =
-        context.record.fragment_program.get(mem)->renderer_data->texture_count;
-    const bool bloonstd5hd_retry_draw =
-        bloonstd5hd_retry_first_textured_draw()
-        && context.last_frag_texture_count == 0
-        && fragment_texture_count > 0
-        && count == 6
-        && instance_count == 1;
     draw_bind_descriptors(context, mem);
     static uint32_t nba2k16_crowd_uniform_draw_count = 0;
     const bool nba2k16_crowd_draw_trace = !use_memory_mapping
@@ -1063,11 +1060,6 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
             mg2_clear_call, count, instance_count);
         std::fflush(stderr);
     }
-    if (bloonstd5hd_retry_draw)
-        context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
-
-    context.vertex_uniform_storage_allocated = false;
-    context.fragment_uniform_storage_allocated = false;
 }
 
 } // namespace renderer::vulkan
