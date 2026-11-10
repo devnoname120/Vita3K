@@ -703,10 +703,7 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
         LOG_INFO("Scripted input path='{}'", scripted_input.path);
 
         const char *capture_setting = std::getenv("VITA3K_WAW_CAPTURE");
-        const bool capture_frames = (launch_request.app_path == "WAW000001" || launch_request.app_path == "BIOS00001"
-                                        || launch_request.app_path == "ACXI00001" || launch_request.app_path == "SIMS30001"
-                                        || launch_request.app_path == "ASPHALT07")
-            && capture_setting && std::strcmp(capture_setting, "1") == 0;
+        const bool capture_frames = capture_setting && std::strcmp(capture_setting, "1") == 0;
         unsigned capture_limit = 24;
         if (const char *capture_limit_setting = std::getenv("VITA3K_WAW_CAPTURE_LIMIT")) {
             char *capture_limit_end = nullptr;
@@ -716,7 +713,7 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
                 capture_limit = static_cast<unsigned>(requested_capture_limit);
             }
         }
-        uint64_t next_capture_tick = SDL_GetTicks() + (launch_request.app_path == "ACXI00001" ? 1000 : 5000);
+        uint64_t next_capture_tick = SDL_GetTicks() + 5000;
         unsigned captured_frames = 0;
         const char *const exit_trace_value = std::getenv("VITA3K_SDL_EXIT_TRACE");
         const bool exit_trace = exit_trace_value && *exit_trace_value && std::strcmp(exit_trace_value, "0") != 0;

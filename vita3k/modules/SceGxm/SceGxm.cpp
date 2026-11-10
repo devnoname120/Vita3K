@@ -3568,16 +3568,12 @@ EXPORT(Ptr<SceGxmProgramParameter>, _sceGxmProgramFindParameterBySemantic, Ptr<c
 
 EXPORT(uint32_t, sceGxmProgramGetDefaultUniformBufferSize, const SceGxmProgram *program) {
     TRACY_FUNC(sceGxmProgramGetDefaultUniformBufferSize, program);
-    if (emuenv.io.title_id == "DDRG00001" && !program) {
+    if (!program) {
         const auto thread = emuenv.kernel.get_thread(thread_id);
         const CPUContext context = thread ? save_context(*thread->cpu) : CPUContext{};
-        std::fprintf(stderr,
-            "DDRG_NULL_GXM_PROGRAM thid=0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X pc=0x%08X lr=0x%08X sp=0x%08X\n",
-            thread_id,
-            context.cpu_registers[0], context.cpu_registers[1],
-            context.cpu_registers[2], context.cpu_registers[3],
-            context.get_pc(), context.get_lr(), context.get_sp());
-        std::fflush(stderr);
+        LOG_ERROR("sceGxmProgramGetDefaultUniformBufferSize: null program pc={} lr={}",
+            log_hex(context.get_pc()), log_hex(context.get_lr()));
+        return 0;
     }
     return program->default_uniform_buffer_count * sizeof(Ptr<const void>);
 }
@@ -4877,44 +4873,7 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
 
 EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, const SceGxmVertexAttribute *attributes, uint32_t attributeCount, const SceGxmVertexStream *streams, uint32_t streamCount, Ptr<SceGxmVertexProgram> *vertexProgram) {
     TRACY_FUNC(sceGxmShaderPatcherCreateVertexProgram, shaderPatcher, programId, attributes, attributeCount, streams, streamCount, vertexProgram);
-    if (emuenv.io.title_id == "FIFA16001") {
-        std::fprintf(stderr,
-            "FIFA_GXM_HLE_DECODED thread=%d attribute_count=%u stream_count=%u attributes=%p streams=%p\n",
-            thread_id, attributeCount, streamCount,
-            static_cast<const void *>(attributes), static_cast<const void *>(streams));
-        std::fflush(stderr);
-    }
     MemState &mem = emuenv.mem;
-    const bool doubledragon_diag = emuenv.io.title_id == "DDRG00001";
-    if (doubledragon_diag) {
-        const Address attribute_address = attributes ? Ptr<const SceGxmVertexAttribute>(attributes, mem).address() : 0;
-        const Address stream_address = streams ? Ptr<const SceGxmVertexStream>(streams, mem).address() : 0;
-        const uint64_t attribute_bytes = uint64_t(sizeof(SceGxmVertexAttribute)) * attributeCount;
-        const uint64_t stream_bytes = uint64_t(sizeof(SceGxmVertexStream)) * streamCount;
-        const uint64_t attribute_end = uint64_t(attribute_address) + attribute_bytes;
-        const uint64_t stream_end = uint64_t(stream_address) + stream_bytes;
-        const bool attribute_range_valid = attributes && attribute_end < 0x100000000ULL
-            && is_valid_addr_range(mem, attribute_address, static_cast<Address>(attribute_end));
-        const bool stream_range_valid = streams && stream_end < 0x100000000ULL
-            && is_valid_addr_range(mem, stream_address, static_cast<Address>(stream_end));
-        Address attribute_allocation = 0;
-        Address stream_allocation = 0;
-        uint32_t attribute_allocation_size = 0;
-        uint32_t stream_allocation_size = 0;
-        const bool attribute_allocation_found = attributes
-            && find_backing_allocation_range(mem, attribute_address, attribute_allocation, attribute_allocation_size);
-        const bool stream_allocation_found = streams
-            && find_backing_allocation_range(mem, stream_address, stream_allocation, stream_allocation_size);
-        std::fprintf(stderr,
-            "DDRG_GXM_VERTEX_ARGS thread=%d attr=0x%08X attr_count=%u attr_bytes=%llu attr_end=0x%llX attr_valid=%d attr_alloc=%d:0x%08X+0x%X stream=0x%08X stream_count=%u stream_bytes=%llu stream_end=0x%llX stream_valid=%d stream_alloc=%d:0x%08X+0x%X\n",
-            thread_id, attribute_address, attributeCount, static_cast<unsigned long long>(attribute_bytes),
-            static_cast<unsigned long long>(attribute_end), attribute_range_valid, attribute_allocation_found,
-            attribute_allocation, attribute_allocation_size, stream_address, streamCount,
-            static_cast<unsigned long long>(stream_bytes), static_cast<unsigned long long>(stream_end),
-            stream_range_valid, stream_allocation_found, stream_allocation, stream_allocation_size);
-        std::fflush(stderr);
-    }
-
     if (!shaderPatcher || !programId || !vertexProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
@@ -4924,27 +4883,11 @@ EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderP
     };
 
     if (attributes) {
-        if (doubledragon_diag) {
-            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH attributes begin\n");
-            std::fflush(stderr);
-        }
         key.hash = hash_data(attributes, sizeof(SceGxmVertexAttribute) * attributeCount);
-        if (doubledragon_diag) {
-            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH attributes end hash=0x%08X\n", key.hash);
-            std::fflush(stderr);
-        }
     }
 
     if (streams) {
-        if (doubledragon_diag) {
-            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH streams begin\n");
-            std::fflush(stderr);
-        }
         key.hash ^= hash_data(streams, sizeof(SceGxmVertexStream) * streamCount);
-        if (doubledragon_diag) {
-            std::fprintf(stderr, "DDRG_GXM_VERTEX_HASH streams end hash=0x%08X\n", key.hash);
-            std::fflush(stderr);
-        }
     }
 
     VertexProgramCache::const_iterator cached = shaderPatcher->vertex_program_cache.find(key);

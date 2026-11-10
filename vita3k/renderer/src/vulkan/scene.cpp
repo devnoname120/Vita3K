@@ -835,8 +835,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         return;
     }
 
-    if (config.run_app_path && *config.run_app_path == "ACXI00001"
-        && (context.viewport.width == 0.0f || context.viewport.height == 0.0f)) {
+    // A context whose viewport was never set has a zero-sized one, which
+    // Vulkan rejects; rasterize over the whole render target instead.
+    if (context.viewport.width == 0.0f || context.viewport.height == 0.0f) {
         context.viewport = vk::Viewport{
             .x = 0.0f,
             .y = 0.0f,
@@ -846,7 +847,7 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
             .maxDepth = 1.0f
         };
         context.render_cmd.setViewport(0, context.viewport);
-        LOG_WARN_ONCE("Ace Combat Xi did not initialize the GXM viewport; using the full render target for rasterization");
+        LOG_WARN_ONCE("GXM viewport not initialized; using the full render target for rasterization");
     }
 
     // update uniforms if needed

@@ -55,7 +55,7 @@ enum class TimerFlags : uint32_t {
 
 TRACY_MODULE_NAME(SceLibKernel);
 
-static std::atomic<uint32_t> fifa_invalid_memcpy_count;
+static std::atomic<uint32_t> invalid_memcpy_count;
 
 inline static uint64_t get_current_time() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -161,8 +161,8 @@ EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, Ptr<const void> src, SceSize len
     if (!copy_guest_memory(emuenv.mem, dst.address(), src.address(), len)) {
         LOG_ERROR("sceClibMemcpy invalid guest range dst={} src={} len={}",
             log_hex_full(dst.address()), log_hex_full(src.address()), len);
-        if (emuenv.io.title_id == "FIFA16001") {
-            const uint32_t sequence = fifa_invalid_memcpy_count.fetch_add(1, std::memory_order_relaxed);
+        {
+            const uint32_t sequence = invalid_memcpy_count.fetch_add(1, std::memory_order_relaxed);
             if (sequence < 16) {
                 const auto thread = emuenv.kernel.get_thread(thread_id);
                 const CPUContext context = thread ? save_context(*thread->cpu) : CPUContext{};
@@ -174,7 +174,7 @@ EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, Ptr<const void> src, SceSize len
                     emuenv.mem, dst.address(), destination_base, destination_size);
                 const bool source_allocated = find_backing_allocation_range(
                     emuenv.mem, src.address(), source_base, source_size);
-                LOG_ERROR("FIFA_INVALID_MEMCPY sequence={} thid=0x{:08X} dst={} src={} len=0x{:X} dst_span=0x{:X} src_span=0x{:X} dst_alloc={}@0x{:08X}+0x{:X} src_alloc={}@0x{:08X}+0x{:X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
+                LOG_ERROR("sceClibMemcpy invalid range detail sequence={} thid=0x{:08X} dst={} src={} len=0x{:X} dst_span=0x{:X} src_span=0x{:X} dst_alloc={}@0x{:08X}+0x{:X} src_alloc={}@0x{:08X}+0x{:X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} pc=0x{:08X} lr=0x{:08X} sp=0x{:08X}",
                     sequence, thread_id, log_hex_full(dst.address()), log_hex_full(src.address()), len,
                     mapped_contiguous_size(emuenv.mem, dst.address(), len),
                     mapped_contiguous_size(emuenv.mem, src.address(), len),
