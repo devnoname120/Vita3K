@@ -1753,7 +1753,14 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                     w_clamp_enabled = b.createLoad(w_clamp_enabled, spv::NoPrecision);
                     w_clamp_value = b.createLoad(w_clamp_value, spv::NoPrecision);
                     post_viewport_clip = b.createLoad(post_viewport_clip, spv::NoPrecision);
-                    const spv::Id w_clamp_pred = b.createOp(spv::OpFOrdGreaterThan, b.makeBoolType(), { w_clamp_enabled, half });
+                    // GXM clamps the divisor of vertices in front of the eye only. A vertex
+                    // behind it (w <= 0) is left to the host clipper: dividing it by the clamp
+                    // flips and inflates its position, and the clipper then interpolates edges
+                    // toward that bogus point (screen-wide streaks in Archetype HD and
+                    // Solomon's Keep).
+                    const spv::Id w_clamp_enabled_pred = b.createOp(spv::OpFOrdGreaterThan, b.makeBoolType(), { w_clamp_enabled, half });
+                    const spv::Id w_in_front_pred = b.createOp(spv::OpFOrdGreaterThan, b.makeBoolType(), { original_w, zero });
+                    const spv::Id w_clamp_pred = b.createBinOp(spv::OpLogicalAnd, b.makeBoolType(), w_clamp_enabled_pred, w_in_front_pred);
                     const spv::Id post_viewport_clip_pred = b.createOp(spv::OpFOrdGreaterThan, b.makeBoolType(), { post_viewport_clip, half });
                     const spv::Id force_clip_reject_pred = b.createOp(
                         spv::OpFOrdEqual, b.makeBoolType(), { post_viewport_clip, two });
