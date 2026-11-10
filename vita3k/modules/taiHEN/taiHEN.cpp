@@ -1352,9 +1352,14 @@ static bool is_ttbr_remap_hle_nid(uint32_t nid) {
     }
 }
 
+// Every title that loads the ttbr_remap plugin gets the HLE, so the ports start
+// from the GUI like any other app. VITA3K_TTBR_REMAP_HLE_TITLE, when set,
+// limits it to that title ("none" turns it off).
 static bool ttbr_remap_hle_enabled_for_title(const std::string &titleid) {
     const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
-    return requested_title && *requested_title && titleid == requested_title;
+    if (!requested_title || !*requested_title)
+        return true;
+    return titleid == requested_title;
 }
 #endif
 

@@ -180,8 +180,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     params.host_may_destroy_params = SDL_CreateSemaphore(0);
     SDL_Thread *host_thread = nullptr;
 #ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
-    const char *ttbr_hle_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
-    if (ttbr_hle_title && *ttbr_hle_title) {
+    {
         // Nested TTBR execution and Apple unwind lookup can exceed macOS's
         // 512 KiB SDL default while loading large guest scenes.
         const SDL_PropertiesID properties = SDL_CreateProperties();
