@@ -124,6 +124,21 @@ endif()
 set(DYNARMIC_TESTS OFF CACHE BOOL "")
 set(DYNARMIC_NO_BUNDLED_FMT ON CACHE BOOL "")
 set(DYNARMIC_FRONTENDS "A32" CACHE STRING "")
+# mach-o-vita: the dynarmic changes the ports need (macOS fault handling for
+# low guest mappings, CP15 access, address-space hooks) live in a patch on the
+# pinned submodule revision. Apply it once; an already-patched tree is left alone.
+set(DYNARMIC_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/dynarmic-mach-o-vita.patch")
+execute_process(COMMAND git apply --reverse --check "${DYNARMIC_PATCH}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dynarmic"
+    RESULT_VARIABLE DYNARMIC_PATCH_PRESENT OUTPUT_QUIET ERROR_QUIET)
+if(NOT DYNARMIC_PATCH_PRESENT EQUAL 0)
+    execute_process(COMMAND git apply "${DYNARMIC_PATCH}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dynarmic"
+        RESULT_VARIABLE DYNARMIC_PATCH_RESULT)
+    if(NOT DYNARMIC_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Could not apply ${DYNARMIC_PATCH}")
+    endif()
+endif()
 add_subdirectory(dynarmic)
 
 if(MSVC)

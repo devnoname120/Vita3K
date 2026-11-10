@@ -1,0 +1,630 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925f..c55aa624 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -18,8 +18,60 @@
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/ir/opt/passes.h"
+ 
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
++static void GravityGuyTracePc(A32JitState& context) {
++    static const bool enabled = std::getenv("VITA3K_GRAVITY_PC_TRACE") != nullptr;
++    static std::atomic<u32> active{};
++    static std::atomic<u32> dispatches{};
++    static std::atomic<u32> samples{};
++    if (!enabled) {
++        return;
++    }
++
++    const A32::LocationDescriptor location{context.GetLocationDescriptor()};
++    const u32 pc = location.PC();
++    u32 expected = 0;
++    if ((pc == 0x000a1fac || pc == 0x00053e48) &&
++        active.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
++        dispatches.store(0, std::memory_order_relaxed);
++        samples.store(0, std::memory_order_relaxed);
++        std::fprintf(stderr,
++            "GRAVITY_PC_TRACE_BEGIN pc=0x%08x lr=0x%08x sp=0x%08x\n",
++            pc, context.regs[14], context.regs[13]);
++        std::fflush(stderr);
++    }
++    if (!active.load(std::memory_order_relaxed)) {
++        return;
++    }
++
++    const u32 dispatch = dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
++    if ((dispatch & 63u) != 0) {
++        return;
++    }
++    const u32 sample = samples.fetch_add(1, std::memory_order_relaxed);
++    if (sample >= 128u) {
++        active.store(0, std::memory_order_relaxed);
++        return;
++    }
++    std::fprintf(stderr,
++        "GRAVITY_PC_TRACE sample=%u dispatch=%u pc=0x%08x thumb=%u "
++        "lr=0x%08x sp=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x cpsr=0x%08x\n",
++        sample, dispatch, pc, location.TFlag() ? 1u : 0u,
++        context.regs[14], context.regs[13], context.regs[0], context.regs[1],
++        context.regs[2], context.regs[3], context.Cpsr());
++    std::fflush(stderr);
++    if (sample + 1u == 128u) {
++        active.store(0, std::memory_order_relaxed);
++        std::fprintf(stderr, "GRAVITY_PC_TRACE_END dispatch=%u\n", dispatch);
++        std::fflush(stderr);
++    }
++}
++
+ template<auto mfp, typename T>
+ static void* EmitCallTrampoline(oaknut::CodeGenerator& code, T* this_) {
+     using namespace oaknut::util;
+@@ -323,6 +375,7 @@ void A32AddressSpace::EmitPrelude() {
+         code.BR(X0);
+ 
+         const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
++            GravityGuyTracePc(context);
+             return self.GetOrEmit(context.GetLocationDescriptor());
+         };
+ 
+diff --git a/src/dynarmic/backend/arm64/a32_interface.cpp b/src/dynarmic/backend/arm64/a32_interface.cpp
+index 6b38c410..896fb7aa 100644
+--- a/src/dynarmic/backend/arm64/a32_interface.cpp
++++ b/src/dynarmic/backend/arm64/a32_interface.cpp
+@@ -3,8 +3,12 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <functional>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ 
+ #include <boost/icl/interval_set.hpp>
+ #include <mcl/assert.hpp>
+@@ -21,12 +25,45 @@ namespace Dynarmic::A32 {
+ 
+ using namespace Backend::Arm64;
+ 
++static bool DynarmicJitLifetimeTraceEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("VITA3K_DYNARMIC_JIT_TRACE");
++        return value && value[0] == '1' && value[1] == 0;
++    }();
++    return enabled;
++}
++
++static std::size_t DynarmicHostThreadTag() {
++    return std::hash<std::thread::id>{}(std::this_thread::get_id());
++}
++
+ struct Jit::Impl final {
+     Impl(Jit* jit_interface, A32::UserConfig conf)
+             : jit_interface(jit_interface)
+             , conf(conf)
+             , current_address_space(conf)
+-            , core(conf) {}
++            , core(conf) {
++        if (DynarmicJitLifetimeTraceEnabled()) {
++            std::fprintf(stderr,
++                "DYNARMIC_JIT_IMPL_CREATE api=%p impl=%p address_space=%p page_table=%p fastmem=0x%zx processor_id=%zu host_thread=0x%zx\n",
++                static_cast<void*>(jit_interface), static_cast<void*>(this),
++                static_cast<void*>(&current_address_space), static_cast<void*>(conf.page_table),
++                static_cast<std::size_t>(conf.fastmem_pointer.value_or(0)), conf.processor_id,
++                DynarmicHostThreadTag());
++            std::fflush(stderr);
++        }
++    }
++
++    ~Impl() {
++        if (DynarmicJitLifetimeTraceEnabled()) {
++            std::fprintf(stderr,
++                "DYNARMIC_JIT_IMPL_DESTROY api=%p impl=%p address_space=%p executing=%u host_thread=0x%zx\n",
++                static_cast<void*>(jit_interface), static_cast<void*>(this),
++                static_cast<void*>(&current_address_space), jit_interface->IsExecuting() ? 1u : 0u,
++                DynarmicHostThreadTag());
++            std::fflush(stderr);
++        }
++    }
+ 
+     HaltReason Run() {
+         ASSERT(!jit_interface->is_executing);
+@@ -164,9 +201,24 @@ private:
+ };
+ 
+ Jit::Jit(UserConfig conf)
+-        : impl(std::make_unique<Impl>(this, conf)) {}
++        : impl(std::make_unique<Impl>(this, conf)) {
++    if (DynarmicJitLifetimeTraceEnabled()) {
++        std::fprintf(stderr,
++            "DYNARMIC_JIT_CREATE api=%p impl=%p host_thread=0x%zx\n",
++            static_cast<void*>(this), static_cast<void*>(impl.get()), DynarmicHostThreadTag());
++        std::fflush(stderr);
++    }
++}
+ 
+-Jit::~Jit() = default;
++Jit::~Jit() {
++    if (DynarmicJitLifetimeTraceEnabled()) {
++        std::fprintf(stderr,
++            "DYNARMIC_JIT_DESTROY api=%p impl=%p executing=%u host_thread=0x%zx\n",
++            static_cast<void*>(this), static_cast<void*>(impl.get()), IsExecuting() ? 1u : 0u,
++            DynarmicHostThreadTag());
++        std::fflush(stderr);
++    }
++}
+ 
+ HaltReason Jit::Run() {
+     return impl->Run();
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..2cd2b44f 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -4,6 +4,9 @@
+  */
+ 
+ #include <cstdio>
++#include <cstdlib>
++#include <functional>
++#include <thread>
+ 
+ #include <mcl/bit_cast.hpp>
+ 
+@@ -20,6 +23,18 @@
+ 
+ namespace Dynarmic::Backend::Arm64 {
+ 
++static bool DynarmicJitLifetimeTraceEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("VITA3K_DYNARMIC_JIT_TRACE");
++        return value && value[0] == '1' && value[1] == 0;
++    }();
++    return enabled;
++}
++
++static std::size_t DynarmicHostThreadTag() {
++    return std::hash<std::thread::id>{}(std::this_thread::get_id());
++}
++
+ AddressSpace::AddressSpace(size_t code_cache_size)
+         : code_cache_size(code_cache_size)
+         , mem(code_cache_size)
+@@ -31,9 +46,26 @@ AddressSpace::AddressSpace(size_t code_cache_size)
+     exception_handler.SetFastmemCallback([this](u64 host_pc) {
+         return FastmemCallback(host_pc);
+     });
++    if (DynarmicJitLifetimeTraceEnabled()) {
++        std::fprintf(stderr,
++            "DYNARMIC_ADDRESS_SPACE_CREATE as=%p source=%p begin=%p end=0x%zx size=%zu host_thread=0x%zx\n",
++            static_cast<void*>(this), static_cast<void*>(&mem), static_cast<void*>(mem.ptr()),
++            reinterpret_cast<std::uintptr_t>(mem.ptr()) + code_cache_size, code_cache_size,
++            DynarmicHostThreadTag());
++        std::fflush(stderr);
++    }
+ }
+ 
+-AddressSpace::~AddressSpace() = default;
++AddressSpace::~AddressSpace() {
++    if (DynarmicJitLifetimeTraceEnabled()) {
++        std::fprintf(stderr,
++            "DYNARMIC_ADDRESS_SPACE_DESTROY as=%p source=%p begin=%p end=0x%zx used=%td host_thread=0x%zx\n",
++            static_cast<void*>(this), static_cast<void*>(&mem), static_cast<void*>(mem.ptr()),
++            reinterpret_cast<std::uintptr_t>(mem.ptr()) + code_cache_size, code.offset(),
++            DynarmicHostThreadTag());
++        std::fflush(stderr);
++    }
++}
+ 
+ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
+     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+index 5115fbbb..ad433259 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+@@ -3,6 +3,9 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ #include <oaknut/oaknut.hpp>
+ 
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+@@ -10,6 +13,7 @@
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ #include "dynarmic/backend/arm64/emit_context.h"
+ #include "dynarmic/backend/arm64/reg_alloc.h"
++#include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/interface/A32/coprocessor.h"
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/microinstruction.h"
+@@ -19,8 +23,19 @@ namespace Dynarmic::Backend::Arm64 {
+ 
+ using namespace oaknut::util;
+ 
+-static void EmitCoprocessorException() {
+-    ASSERT_FALSE("Should raise coproc exception here");
++static void EmitCoprocessorException(EmitContext& ctx, const char* operation, const IR::Value::CoprocessorInfo& info) {
++    const A32::LocationDescriptor begin{ctx.block.Location()};
++    const A32::LocationDescriptor end{ctx.block.EndLocation()};
++    std::fprintf(stderr,
++        "DYNARMIC_COPROC_UNHANDLED operation=%s begin=0x%08x end=0x%08x thumb=%u "
++        "info=%u,%u,%u,%u,%u,%u,%u,%u\n",
++        operation,
++        begin.PC(),
++        end.PC(),
++        begin.TFlag() ? 1u : 0u,
++        info[0], info[1], info[2], info[3], info[4], info[5], info[6], info[7]);
++    std::fflush(stderr);
++    std::abort();
+ }
+ 
+ static void CallCoprocCallback(oaknut::CodeGenerator& code, EmitContext& ctx, A32::Coprocessor::Callback callback, IR::Inst* inst = nullptr, std::optional<Argument::copyable_reference> arg0 = {}, std::optional<Argument::copyable_reference> arg1 = {}) {
+@@ -51,13 +66,13 @@ void EmitIR<IR::Opcode::A32CoprocInternalOperation>(oaknut::CodeGenerator& code,
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "internal", coproc_info);
+         return;
+     }
+ 
+     const auto action = coproc->CompileInternalOperation(two, opc1, CRd, CRn, CRm, opc2);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "internal", coproc_info);
+         return;
+     }
+ 
+@@ -77,14 +92,14 @@ void EmitIR<IR::Opcode::A32CoprocSendOneWord>(oaknut::CodeGenerator& code, EmitC
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "send-one-word", coproc_info);
+         return;
+     }
+ 
+     const auto action = coproc->CompileSendOneWord(two, opc1, CRn, CRm, opc2);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "send-one-word", coproc_info);
+         return;
+     }
+ 
+@@ -118,14 +133,14 @@ void EmitIR<IR::Opcode::A32CoprocSendTwoWords>(oaknut::CodeGenerator& code, Emit
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "send-two-words", coproc_info);
+         return;
+     }
+ 
+     const auto action = coproc->CompileSendTwoWords(two, opc, CRm);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "send-two-words", coproc_info);
+         return;
+     }
+ 
+@@ -163,14 +178,14 @@ void EmitIR<IR::Opcode::A32CoprocGetOneWord>(oaknut::CodeGenerator& code, EmitCo
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "get-one-word", coproc_info);
+         return;
+     }
+ 
+     const auto action = coproc->CompileGetOneWord(two, opc1, CRn, CRm, opc2);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "get-one-word", coproc_info);
+         return;
+     }
+ 
+@@ -202,14 +217,14 @@ void EmitIR<IR::Opcode::A32CoprocGetTwoWords>(oaknut::CodeGenerator& code, EmitC
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "get-two-words", coproc_info);
+         return;
+     }
+ 
+     auto action = coproc->CompileGetTwoWords(two, opc, CRm);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "get-two-words", coproc_info);
+         return;
+     }
+ 
+@@ -252,13 +267,13 @@ void EmitIR<IR::Opcode::A32CoprocLoadWords>(oaknut::CodeGenerator& code, EmitCon
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "load-words", coproc_info);
+         return;
+     }
+ 
+     const auto action = coproc->CompileLoadWords(two, long_transfer, CRd, option);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "load-words", coproc_info);
+         return;
+     }
+ 
+@@ -283,13 +298,13 @@ void EmitIR<IR::Opcode::A32CoprocStoreWords>(oaknut::CodeGenerator& code, EmitCo
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "store-words", coproc_info);
+         return;
+     }
+ 
+     const auto action = coproc->CompileStoreWords(two, long_transfer, CRd, option);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(ctx, "store-words", coproc_info);
+         return;
+     }
+ 
+diff --git a/src/dynarmic/backend/exception_handler_macos.cpp b/src/dynarmic/backend/exception_handler_macos.cpp
+index bac8d9c9..ed281ce0 100644
+--- a/src/dynarmic/backend/exception_handler_macos.cpp
++++ b/src/dynarmic/backend/exception_handler_macos.cpp
+@@ -4,8 +4,12 @@
+  */
+ 
+ #include <mach/mach.h>
++#include <mach/mach_vm.h>
+ #include <mach/message.h>
+ 
++#include <array>
++#include <atomic>
++#include <cstdlib>
+ #include <cstring>
+ #include <functional>
+ #include <memory>
+@@ -50,8 +54,25 @@ namespace Dynarmic::Backend {
+ 
+ namespace {
+ 
++bool JitLifetimeTraceEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("VITA3K_DYNARMIC_JIT_TRACE");
++        return value && value[0] == '1' && value[1] == 0;
++    }();
++    return enabled;
++}
++
++std::size_t HostThreadTag() {
++    return std::hash<std::thread::id>{}(std::this_thread::get_id());
++}
++
++std::atomic<u64> next_code_block_generation{1};
++
+ struct CodeBlockInfo {
+     u64 code_begin, code_end;
++    u64 generation;
++    const void* owner;
++    const void* source;
+     std::function<FakeCall(u64)> cb;
+ };
+ 
+@@ -68,7 +89,7 @@ public:
+     kern_return_t HandleRequest(dynarmic_thread_state_t* thread_state);
+ 
+     void AddCodeBlock(CodeBlockInfo info);
+-    void RemoveCodeBlock(u64 rip);
++    void RemoveCodeBlock(u64 rip, u64 generation, const void* owner);
+ 
+ private:
+     auto FindCodeBlockInfo(u64 rip) {
+@@ -99,9 +120,19 @@ MachHandler::MachHandler() {
+ 
+     thread = std::thread(&MachHandler::MessagePump, this);
+     thread.detach();
++    if (JitLifetimeTraceEnabled()) {
++        fmt::print(stderr,
++                   "DYNARMIC_MACH_HANDLER_CREATE handler={:p} port={} host_thread={:#x}\n",
++                   static_cast<const void*>(this), server_port, HostThreadTag());
++    }
+ }
+ 
+ MachHandler::~MachHandler() {
++    if (JitLifetimeTraceEnabled()) {
++        fmt::print(stderr,
++                   "DYNARMIC_MACH_HANDLER_DESTROY handler={:p} port={} blocks={} host_thread={:#x}\n",
++                   static_cast<const void*>(this), server_port, code_block_infos.size(), HostThreadTag());
++    }
+     mach_port_deallocate(mach_task_self(), server_port);
+ }
+ 
+@@ -154,7 +185,21 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
+ 
+     const auto iter = FindCodeBlockInfo(ts->__pc);
+     if (iter == code_block_infos.end()) {
+-        fmt::print(stderr, "Unhandled EXC_BAD_ACCESS at pc {:#016x}\n", ts->__pc);
++        fmt::print(stderr,
++                   "Unhandled EXC_BAD_ACCESS at pc {:#016x} sp={:#016x} fp={:#016x} lr={:#016x} blocks={}\n",
++                   ts->__pc, ts->__sp, ts->__fp, ts->__lr, code_block_infos.size());
++        for (size_t i = 0; i < code_block_infos.size(); i++) {
++            const auto& block = code_block_infos[i];
++            fmt::print(stderr, "DYNARMIC_CODE_BLOCK index={} begin={:#016x} end={:#016x}\n",
++                       i, block.code_begin, block.code_end);
++        }
++        for (size_t i = 0; i < 28; i += 4) {
++            fmt::print(stderr,
++                       "DYNARMIC_HOST_REGS x{}={:#016x} x{}={:#016x} x{}={:#016x} x{}={:#016x}\n",
++                       i, ts->__x[i], i + 1, ts->__x[i + 1], i + 2, ts->__x[i + 2],
++                       i + 3, ts->__x[i + 3]);
++        }
++        fmt::print(stderr, "DYNARMIC_HOST_REGS x28={:#016x}\n", ts->__x[28]);
+         return KERN_FAILURE;
+     }
+ 
+@@ -169,18 +214,43 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
+ 
+ void MachHandler::AddCodeBlock(CodeBlockInfo cbi) {
+     std::lock_guard<std::mutex> guard(code_block_infos_mutex);
++    u64 replaced_generation = 0;
++    const void* replaced_owner = nullptr;
+     if (auto iter = FindCodeBlockInfo(cbi.code_begin); iter != code_block_infos.end()) {
++        replaced_generation = iter->generation;
++        replaced_owner = iter->owner;
+         code_block_infos.erase(iter);
+     }
+     code_block_infos.push_back(cbi);
++    if (JitLifetimeTraceEnabled()) {
++        fmt::print(stderr,
++                   "DYNARMIC_CODE_BLOCK_ADD handler={:p} generation={} owner={:p} source={:p} begin={:#016x} end={:#016x} replaced_generation={} replaced_owner={:p} blocks={} host_thread={:#x}\n",
++                   static_cast<const void*>(this), cbi.generation, cbi.owner, cbi.source,
++                   cbi.code_begin, cbi.code_end, replaced_generation, replaced_owner,
++                   code_block_infos.size(), HostThreadTag());
++    }
+ }
+ 
+-void MachHandler::RemoveCodeBlock(u64 rip) {
++void MachHandler::RemoveCodeBlock(u64 rip, u64 generation, const void* owner) {
+     std::lock_guard<std::mutex> guard(code_block_infos_mutex);
+     const auto iter = FindCodeBlockInfo(rip);
+     if (iter == code_block_infos.end()) {
++        if (JitLifetimeTraceEnabled()) {
++            fmt::print(stderr,
++                       "DYNARMIC_CODE_BLOCK_REMOVE_MISS handler={:p} expected_generation={} expected_owner={:p} begin={:#016x} blocks={} host_thread={:#x}\n",
++                       static_cast<const void*>(this), generation, owner, rip,
++                       code_block_infos.size(), HostThreadTag());
++        }
+         return;
+     }
++    if (JitLifetimeTraceEnabled()) {
++        fmt::print(stderr,
++                   "DYNARMIC_CODE_BLOCK_REMOVE handler={:p} expected_generation={} expected_owner={:p} actual_generation={} actual_owner={:p} source={:p} begin={:#016x} end={:#016x} mismatch={} blocks_before={} host_thread={:#x}\n",
++                   static_cast<const void*>(this), generation, owner, iter->generation,
++                   iter->owner, iter->source, iter->code_begin, iter->code_end,
++                   iter->generation != generation || iter->owner != owner,
++                   code_block_infos.size(), HostThreadTag());
++    }
+     code_block_infos.erase(iter);
+ }
+ 
+@@ -209,8 +279,8 @@ mig_external kern_return_t catch_mach_exception_raise_state_identity(mach_port_t
+ mig_external kern_return_t catch_mach_exception_raise_state(
+     mach_port_t /*exception_port*/,
+     exception_type_t exception,
+-    const mach_exception_data_t /*code*/,  // code[0] is as per kern_return.h, code[1] is rip.
+-    mach_msg_type_number_t /*codeCnt*/,
++    const mach_exception_data_t code,
++    mach_msg_type_number_t codeCnt,
+     int* flavor,
+     const thread_state_t old_state,
+     mach_msg_type_number_t old_stateCnt,
+@@ -235,32 +305,74 @@ mig_external kern_return_t catch_mach_exception_raise_state(
+ 
+     kern_return_t ret = mach_handler->HandleRequest(&ts);
+ 
++    if (ret != KERN_SUCCESS) {
++        const u64 exception_code = codeCnt > 0 ? code[0] : 0;
++        const u64 fault_address = codeCnt > 1 ? code[1] : 0;
++        fmt::print(stderr,
++                   "DYNARMIC_UNHANDLED_ACCESS code={:#016x} fault={:#016x} count={} cpsr={:#010x}\n",
++                   exception_code, fault_address, codeCnt, ts.__cpsr);
++#if defined(MCL_ARCHITECTURE_ARM64)
++        std::array<u8, 96> bytes{};
++        const u64 code_start = ts.__pc >= 32 ? ts.__pc - 32 : 0;
++        mach_vm_size_t copied = 0;
++        const kern_return_t read_result = mach_vm_read_overwrite(
++            mach_task_self(), code_start, bytes.size(),
++            mcl::bit_cast<mach_vm_address_t>(bytes.data()), &copied);
++        fmt::print(stderr,
++                   "DYNARMIC_HOST_CODE start={:#016x} copied={} result={:#010x} bytes=",
++                   code_start, copied, read_result);
++        for (mach_vm_size_t i = 0; i < copied; i++) {
++            fmt::print(stderr, "{:02x}", bytes[i]);
++        }
++        fmt::print(stderr, "\n");
++#endif
++    }
++
+     std::memcpy(new_state, &ts, sizeof(ts));
+     *new_stateCnt = THREAD_STATE_COUNT;
+     return ret;
+ }
+ 
+ struct ExceptionHandler::Impl final {
+-    Impl(u64 code_begin_, u64 code_end_)
++    Impl(u64 code_begin_, u64 code_end_, const void* source_)
+             : code_begin(code_begin_)
+-            , code_end(code_end_) {
++            , code_end(code_end_)
++            , generation(next_code_block_generation.fetch_add(1, std::memory_order_relaxed))
++            , source(source_) {
+         RegisterHandler();
++        if (JitLifetimeTraceEnabled()) {
++            fmt::print(stderr,
++                       "DYNARMIC_EXCEPTION_IMPL_CREATE impl={:p} generation={} source={:p} begin={:#016x} end={:#016x} host_thread={:#x}\n",
++                       static_cast<const void*>(this), generation, source, code_begin, code_end,
++                       HostThreadTag());
++        }
+     }
+ 
+     void SetCallback(std::function<FakeCall(u64)> cb) {
+         CodeBlockInfo cbi;
+         cbi.code_begin = code_begin;
+         cbi.code_end = code_end;
++        cbi.generation = generation;
++        cbi.owner = this;
++        cbi.source = source;
+         cbi.cb = cb;
+         mach_handler->AddCodeBlock(cbi);
+     }
+ 
+     ~Impl() {
+-        mach_handler->RemoveCodeBlock(code_begin);
++        if (JitLifetimeTraceEnabled()) {
++            fmt::print(stderr,
++                       "DYNARMIC_EXCEPTION_IMPL_DESTROY impl={:p} generation={} source={:p} begin={:#016x} end={:#016x} host_thread={:#x}\n",
++                       static_cast<const void*>(this), generation, source, code_begin, code_end,
++                       HostThreadTag());
++        }
++        mach_handler->RemoveCodeBlock(code_begin, generation, this);
+     }
+ 
+ private:
+     u64 code_begin, code_end;
++    u64 generation;
++    const void* source;
+ };
+ 
+ ExceptionHandler::ExceptionHandler() = default;
+@@ -270,13 +382,13 @@ ExceptionHandler::~ExceptionHandler() = default;
+ void ExceptionHandler::Register(X64::BlockOfCode& code) {
+     const u64 code_begin = mcl::bit_cast<u64>(code.getCode());
+     const u64 code_end = code_begin + code.GetTotalCodeSize();
+-    impl = std::make_unique<Impl>(code_begin, code_end);
++    impl = std::make_unique<Impl>(code_begin, code_end, &code);
+ }
+ #elif defined(MCL_ARCHITECTURE_ARM64)
+ void ExceptionHandler::Register(oaknut::CodeBlock& mem, std::size_t size) {
+     const u64 code_begin = mcl::bit_cast<u64>(mem.ptr());
+     const u64 code_end = code_begin + size;
+-    impl = std::make_unique<Impl>(code_begin, code_end);
++    impl = std::make_unique<Impl>(code_begin, code_end, &mem);
+ }
+ #else
+ #    error "Invalid architecture"
