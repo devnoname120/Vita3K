@@ -552,9 +552,17 @@ EXPORT(int, ttbr_remap_run, uint32_t handle, Ptr<TtbrRemapContext> user_context,
     const uint64_t tick_budget = options.quantum_us
         ? static_cast<uint64_t>(options.quantum_us) * TTBR_REMAP_HLE_TICKS_PER_US
         : CPU_RUN_UNBOUNDED_TICKS;
-    const CPUContextRunResult run = run_context_until_trap(
+    CPUContextRunResult run = run_context_until_trap(
         *thread->cpu, to_cpu_context(context), context.tpidruro, context.tpidrurw,
         tick_budget);
+    // An unbounded run has no timer exit to report a halt with. A halt that
+    // leaves the thread runnable (another thread invalidating JIT code, say)
+    // is invisible on hardware, where it is an interrupt the kernel returns
+    // from, so the guest simply continues.
+    while (!options.quantum_us && run.reason == CPUContextRunReason::Error && run.cpu_result == 0
+        && thread->can_resume_nested_run()) {
+        run = run_context_until_trap(*thread->cpu, run.context, run.tpidruro, run.tpidrurw, tick_budget);
+    }
     {
         const std::lock_guard<std::mutex> lock(state->mutex);
         const auto space = state->spaces.find(handle);
