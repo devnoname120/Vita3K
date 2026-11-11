@@ -1041,7 +1041,7 @@ EXPORT(SceInt32, sceKernelChangeThreadCpuAffinityMask, SceUID thid, SceInt32 aff
 
     const SceInt32 old_affinity = thread->affinity_mask;
 
-    if (affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL)
+    if (affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_VALID)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK);
 
     thread->affinity_mask = affinity_mask;
@@ -1196,7 +1196,7 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
     if (options->stack_size <= 0)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE);
-    if (options->cpu_affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL) {
+    if (options->cpu_affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_VALID) {
         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_CPU_AFFINITY);
     }
     // The new thread starts at the creating thread's current priority
