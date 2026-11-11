@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -124,16 +125,34 @@ struct AliasAllocation {
     uint32_t size;
 };
 
-struct TtbrRemapHleState {
-    std::mutex mutex;
-    uint32_t generation = 0;
-    uint32_t handle = 0;
+// One address space per handle. The loader's lanes (ttbr_remap_lane1..3) are
+// separate libraries with the same function NIDs, so every lane lands here and
+// each create needs its own handle. Vita3K has one guest address space, so an
+// alias that several spaces map (the lanes apply every edit to each of them)
+// is installed once and counted.
+struct TtbrRemapSpace {
     bool mapping_failed = false;
     bool run_active = false;
     CPUContext last_context;
     std::vector<TrackedRange> mappings;
     std::vector<AliasAllocation> aliases;
 };
+
+struct SharedAlias {
+    uint32_t guest_va;
+    uint32_t user_va;
+    uint32_t size;
+    uint32_t refs;
+};
+
+struct TtbrRemapHleState {
+    std::mutex mutex;
+    uint32_t generation = 0;
+    std::map<uint32_t, TtbrRemapSpace> spaces;
+    std::vector<SharedAlias> aliases;
+};
+
+constexpr std::size_t TTBR_REMAP_HLE_MAX_SPACES = 4;
 
 bool valid_guest_bytes(const MemState &mem, uint32_t address, uint32_t size) {
     if (!address || !size)
@@ -254,13 +273,45 @@ bool overlaps(uint32_t a_start, uint32_t a_size, uint32_t b_start, uint32_t b_si
     return uint64_t(a_start) < b_end && uint64_t(b_start) < a_end;
 }
 
-bool page_is_mapped(const TtbrRemapHleState &state, uint32_t page) {
+bool page_is_mapped(const TtbrRemapSpace &state, uint32_t page) {
     return std::any_of(state.mappings.begin(), state.mappings.end(), [page](const TrackedRange &mapping) {
         return uint64_t(page) >= mapping.range.guest_va && uint64_t(page) < uint64_t(mapping.range.guest_va) + mapping.range.size;
     });
 }
 
-int map_range(EmuEnvState &emuenv, TtbrRemapHleState &state, const TtbrRemapRange &range) {
+bool acquire_alias(MemState &mem, TtbrRemapHleState &shared, const TtbrRemapRange &range) {
+    for (auto &alias : shared.aliases) {
+        if (alias.guest_va == range.guest_va && alias.size == range.size && alias.user_va == range.user_va) {
+            alias.refs++;
+            return true;
+        }
+        if (overlaps(alias.guest_va, alias.size, range.guest_va, range.size)) {
+            LOG_ERROR("ttbr_remap HLE alias guest={} size={} user={} conflicts with guest={} size={} user={}",
+                log_hex(range.guest_va), log_hex(range.size), log_hex(range.user_va),
+                log_hex(alias.guest_va), log_hex(alias.size), log_hex(alias.user_va));
+            return false;
+        }
+    }
+    if (!add_alias_mapping(mem, range.guest_va, range.user_va, range.size))
+        return false;
+    shared.aliases.push_back({ range.guest_va, range.user_va, range.size, 1 });
+    return true;
+}
+
+bool release_alias(MemState &mem, TtbrRemapHleState &shared, uint32_t guest_va, uint32_t size) {
+    const auto alias = std::find_if(shared.aliases.begin(), shared.aliases.end(),
+        [guest_va, size](const SharedAlias &candidate) {
+            return candidate.guest_va == guest_va && candidate.size == size;
+        });
+    if (alias == shared.aliases.end())
+        return false;
+    if (--alias->refs)
+        return true;
+    shared.aliases.erase(alias);
+    return remove_alias_mapping(mem, guest_va, size);
+}
+
+int map_range(EmuEnvState &emuenv, TtbrRemapHleState &shared, TtbrRemapSpace &state, const TtbrRemapRange &range) {
     if (!range_shape_valid(range, true, true) || !valid_guest_bytes(emuenv.mem, range.user_va, range.size))
         return TTBR_REMAP_ERR_PAGE;
 
@@ -274,7 +325,7 @@ int map_range(EmuEnvState &emuenv, TtbrRemapHleState &state, const TtbrRemapRang
     }
 
     if (range.user_va != range.guest_va) {
-        if (!add_alias_mapping(emuenv.mem, range.guest_va, range.user_va, range.size))
+        if (!acquire_alias(emuenv.mem, shared, range))
             return TTBR_REMAP_ERR_TABLE;
         state.aliases.push_back({ range.guest_va, range.size });
     }
@@ -285,7 +336,7 @@ int map_range(EmuEnvState &emuenv, TtbrRemapHleState &state, const TtbrRemapRang
     return 0;
 }
 
-int unmap_range(EmuEnvState &emuenv, TtbrRemapHleState &state, const TtbrRemapRange &range) {
+int unmap_range(EmuEnvState &emuenv, TtbrRemapHleState &shared, TtbrRemapSpace &state, const TtbrRemapRange &range) {
     if (!range_shape_valid(range, false, false))
         return TTBR_REMAP_ERR_ARG;
 
@@ -308,7 +359,7 @@ int unmap_range(EmuEnvState &emuenv, TtbrRemapHleState &state, const TtbrRemapRa
                     return candidate.guest_va == mapping.range.guest_va && candidate.size == mapping.range.size;
                 });
             if (alias != state.aliases.end()) {
-                if (!remove_alias_mapping(emuenv.mem, alias->guest_va, alias->size))
+                if (!release_alias(emuenv.mem, shared, alias->guest_va, alias->size))
                     return TTBR_REMAP_ERR_STATE;
                 state.aliases.erase(alias);
             }
@@ -334,7 +385,7 @@ int unmap_range(EmuEnvState &emuenv, TtbrRemapHleState &state, const TtbrRemapRa
     return 0;
 }
 
-int protect_range(const TtbrRemapHleState &state, const TtbrRemapRange &range) {
+int protect_range(const TtbrRemapSpace &state, const TtbrRemapRange &range) {
     if (!range_shape_valid(range, false, true))
         return TTBR_REMAP_ERR_ARG;
     for (uint64_t page = range.guest_va; page < uint64_t(range.guest_va) + range.size; page += PAGE_SIZE) {
@@ -344,7 +395,7 @@ int protect_range(const TtbrRemapHleState &state, const TtbrRemapRange &range) {
     return 0;
 }
 
-int sync_code(EmuEnvState &emuenv, const TtbrRemapHleState &state, const TtbrRemapRange &range) {
+int sync_code(EmuEnvState &emuenv, const TtbrRemapSpace &state, const TtbrRemapRange &range) {
     if (!range.size || (range.user_va & (PAGE_SIZE - 1u)) || (range.size & (PAGE_SIZE - 1u)) || uint64_t(range.user_va) + range.size > 0x100000000ull || !valid_guest_bytes(emuenv.mem, range.user_va, range.size))
         return TTBR_REMAP_ERR_ARG;
 
@@ -401,19 +452,14 @@ EXPORT(int, ttbr_remap_create, Ptr<const TtbrRemapCreateInfo> user_info, Ptr<uin
 
     auto *state = emuenv.kernel.obj_store.get<TtbrRemapHleState>();
     const std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->handle || state->generation == std::numeric_limits<uint32_t>::max())
+    if (state->spaces.size() >= TTBR_REMAP_HLE_MAX_SPACES || state->generation == std::numeric_limits<uint32_t>::max())
         return RET_ERROR(TTBR_REMAP_ERR_BUSY);
 
-    state->handle = ++state->generation;
-    state->mapping_failed = false;
-    state->run_active = false;
-    state->mappings.clear();
-    state->aliases.clear();
-    if (!write_guest_bytes(emuenv.mem, user_handle.address(), &state->handle, sizeof(state->handle))) {
-        state->handle = 0;
+    const uint32_t handle = ++state->generation;
+    if (!write_guest_bytes(emuenv.mem, user_handle.address(), &handle, sizeof(handle)))
         return RET_ERROR(TTBR_REMAP_ERR_ARG);
-    }
-    LOG_INFO("ttbr_remap HLE create handle={} flags=0x{:X}", state->handle, info.flags);
+    state->spaces.emplace(handle, TtbrRemapSpace{});
+    LOG_INFO("ttbr_remap HLE create handle={} flags=0x{:X} spaces={}", handle, info.flags, state->spaces.size());
     return 0;
 }
 
@@ -426,11 +472,12 @@ EXPORT(int, ttbr_remap_map, uint32_t handle, Ptr<const TtbrRemapMapping> user_ma
 
     auto *state = emuenv.kernel.obj_store.get<TtbrRemapHleState>();
     const std::lock_guard<std::mutex> lock(state->mutex);
-    if (!handle || handle != state->handle || state->mapping_failed)
+    const auto space = state->spaces.find(handle);
+    if (space == state->spaces.end() || space->second.mapping_failed)
         return RET_ERROR(TTBR_REMAP_ERR_STATE);
-    result = map_range(emuenv, *state, mapping.range);
+    result = map_range(emuenv, *state, space->second, mapping.range);
     if (result < 0)
-        state->mapping_failed = true;
+        space->second.mapping_failed = true;
     return result < 0 ? RET_ERROR(result) : result;
 }
 
@@ -443,28 +490,30 @@ EXPORT(int, ttbr_remap_edit, uint32_t handle, Ptr<const TtbrRemapEditInfo> user_
 
     auto *state = emuenv.kernel.obj_store.get<TtbrRemapHleState>();
     const std::lock_guard<std::mutex> lock(state->mutex);
-    if (!handle || handle != state->handle || state->mapping_failed)
+    const auto found = state->spaces.find(handle);
+    if (found == state->spaces.end() || found->second.mapping_failed)
         return RET_ERROR(TTBR_REMAP_ERR_STATE);
+    TtbrRemapSpace &space = found->second;
 
     switch (edit.op) {
     case TTBR_REMAP_EDIT_MAP:
-        result = map_range(emuenv, *state, edit.range);
+        result = map_range(emuenv, *state, space, edit.range);
         break;
     case TTBR_REMAP_EDIT_UNMAP:
-        result = unmap_range(emuenv, *state, edit.range);
+        result = unmap_range(emuenv, *state, space, edit.range);
         break;
     case TTBR_REMAP_EDIT_PROTECT:
-        result = protect_range(*state, edit.range);
+        result = protect_range(space, edit.range);
         break;
     case TTBR_REMAP_EDIT_SYNC_CODE:
-        result = sync_code(emuenv, *state, edit.range);
+        result = sync_code(emuenv, space, edit.range);
         break;
     default:
         result = TTBR_REMAP_ERR_ARG;
         break;
     }
     if (result < 0)
-        state->mapping_failed = true;
+        space.mapping_failed = true;
     return result < 0 ? RET_ERROR(result) : result;
 }
 
@@ -487,25 +536,36 @@ EXPORT(int, ttbr_remap_run, uint32_t handle, Ptr<TtbrRemapContext> user_context,
         return RET_ERROR(TTBR_REMAP_ERR_ARG);
 
     auto *state = emuenv.kernel.obj_store.get<TtbrRemapHleState>();
-    const std::lock_guard<std::mutex> lock(state->mutex);
-    if (!handle || handle != state->handle || state->mapping_failed)
-        return RET_ERROR(TTBR_REMAP_ERR_STATE);
     const auto thread = emuenv.kernel.get_thread(thread_id);
-    if (!thread || !thread->cpu)
-        return RET_ERROR(TTBR_REMAP_ERR_CORE);
+    {
+        const std::lock_guard<std::mutex> lock(state->mutex);
+        const auto space = state->spaces.find(handle);
+        if (space == state->spaces.end() || space->second.mapping_failed || space->second.run_active)
+            return RET_ERROR(TTBR_REMAP_ERR_STATE);
+        if (!thread || !thread->cpu)
+            return RET_ERROR(TTBR_REMAP_ERR_CORE);
+        space->second.run_active = true;
+    }
 
-    state->run_active = true;
+    // Spaces run concurrently on their own threads; the guest code may block
+    // on another lane, so no lock is held while it runs.
     const uint64_t tick_budget = options.quantum_us
         ? static_cast<uint64_t>(options.quantum_us) * TTBR_REMAP_HLE_TICKS_PER_US
         : CPU_RUN_UNBOUNDED_TICKS;
     const CPUContextRunResult run = run_context_until_trap(
         *thread->cpu, to_cpu_context(context), context.tpidruro, context.tpidrurw,
         tick_budget);
-    state->run_active = false;
+    {
+        const std::lock_guard<std::mutex> lock(state->mutex);
+        const auto space = state->spaces.find(handle);
+        if (space != state->spaces.end()) {
+            space->second.run_active = false;
+            space->second.last_context = run.context;
+        }
+    }
     from_cpu_context(run.context, context);
     context.tpidruro = run.tpidruro;
     context.tpidrurw = run.tpidrurw;
-    state->last_context = run.context;
     acxi_trace_menu_state(emuenv.mem);
 
     std::memset(reinterpret_cast<uint8_t *>(&exit) + sizeof(uint32_t), 0,
@@ -547,19 +607,16 @@ EXPORT(int, ttbr_remap_destroy, uint32_t handle) {
     TRACY_FUNC(ttbr_remap_destroy, handle);
     auto *state = emuenv.kernel.obj_store.get<TtbrRemapHleState>();
     const std::lock_guard<std::mutex> lock(state->mutex);
-    if (!handle || handle != state->handle)
+    const auto space = state->spaces.find(handle);
+    if (space == state->spaces.end() || space->second.run_active)
         return RET_ERROR(TTBR_REMAP_ERR_STATE);
 
     int result = 0;
-    for (const auto &alias : state->aliases) {
-        if (!remove_alias_mapping(emuenv.mem, alias.guest_va, alias.size))
+    for (const auto &alias : space->second.aliases) {
+        if (!release_alias(emuenv.mem, *state, alias.guest_va, alias.size))
             result = TTBR_REMAP_ERR_STATE;
     }
-    state->aliases.clear();
-    state->mappings.clear();
-    state->mapping_failed = false;
-    state->run_active = false;
-    state->handle = 0;
+    state->spaces.erase(space);
     return result < 0 ? RET_ERROR(result) : result;
 }
 
@@ -575,13 +632,14 @@ EXPORT(int, ttbr_remap_debug_state, uint32_t handle, Ptr<TtbrRemapDebugState> us
     const std::unique_lock<std::mutex> lock(state->mutex, std::try_to_lock);
     if (!lock.owns_lock())
         return RET_ERROR(TTBR_REMAP_ERR_BUSY);
-    if (!handle || handle != state->handle)
+    const auto space = state->spaces.find(handle);
+    if (space == state->spaces.end())
         return RET_ERROR(TTBR_REMAP_ERR_STATE);
 
     out.size = output_size;
-    out.phase = state->run_active ? 1u : 0u;
-    out.cpsr = state->last_context.cpsr;
-    out.pc = state->last_context.get_pc();
+    out.phase = space->second.run_active ? 1u : 0u;
+    out.cpsr = space->second.last_context.cpsr;
+    out.pc = space->second.last_context.get_pc();
     out.irq_id = 0;
     return write_guest_bytes(emuenv.mem, user_out.address(), &out, output_size)
         ? 0
