@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -143,7 +144,18 @@ struct SharedAlias {
     uint32_t refs;
 };
 
+// VITA3K_TTBR_REMAP_FRAME_WATCH: the caller's stack frame while its guest runs.
+// Nothing but the guest should run on that thread then, so a word that changes
+// (outside the context, exit and options records) was written by guest code,
+// which on the console runs in another address space.
+struct FrameWatch {
+    uint32_t sp = 0;
+    std::vector<uint8_t> bytes;
+    std::vector<std::pair<uint32_t, uint32_t>> skip;
+};
+
 struct TtbrRemapHleState {
+    std::map<SceUID, FrameWatch> frames;
     std::mutex mutex;
     uint32_t generation = 0;
     std::map<uint32_t, TtbrRemapSpace> spaces;
@@ -188,6 +200,47 @@ bool write_guest_bytes(MemState &mem, uint32_t address, const void *source, uint
         return false;
     std::memcpy(Ptr<uint8_t>(address).get(mem), source, size);
     return true;
+}
+
+constexpr uint32_t FRAME_WATCH_BYTES = 0x400;
+
+bool frame_watch_enabled() {
+    static const bool enabled = std::getenv("VITA3K_TTBR_REMAP_FRAME_WATCH") != nullptr;
+    return enabled;
+}
+
+// VITA3K_TTBR_REMAP_RUN_TRACE=<thread id> logs every run of that thread (0: all).
+bool run_trace_enabled(SceUID thread) {
+    static const int traced = [] {
+        const char *value = std::getenv("VITA3K_TTBR_REMAP_RUN_TRACE");
+        return value ? std::atoi(value) : -1;
+    }();
+    return traced == 0 || traced == thread;
+}
+
+void frame_watch_check(MemState &mem, TtbrRemapHleState &state, SceUID runner, const CPUContext &guest, int reason) {
+    for (auto &[owner, frame] : state.frames) {
+        if (!valid_guest_bytes(mem, frame.sp, FRAME_WATCH_BYTES))
+            continue;
+        const uint8_t *now = Ptr<const uint8_t>(frame.sp).get(mem);
+        for (uint32_t off = 0; off < FRAME_WATCH_BYTES; off += 4) {
+            const uint32_t addr = frame.sp + off;
+            bool skipped = false;
+            for (const auto &[start, size] : frame.skip)
+                skipped |= addr >= start && addr < start + size;
+            if (skipped || std::memcmp(now + off, frame.bytes.data() + off, 4) == 0)
+                continue;
+            uint32_t before, after;
+            std::memcpy(&before, frame.bytes.data() + off, 4);
+            std::memcpy(&after, now + off, 4);
+            LOG_WARN("ttbr_remap FRAME_WATCH owner={} sp={} addr={} off=0x{:X} old={} new={} runner={} guest pc={} sp={} lr={} r0={} r1={} r2={} r3={} r4={} r7={} reason={}",
+                owner, log_hex(frame.sp), log_hex(addr), off, log_hex(before), log_hex(after), runner,
+                log_hex(guest.get_pc()), log_hex(guest.cpu_registers[13]), log_hex(guest.cpu_registers[14]),
+                log_hex(guest.cpu_registers[0]), log_hex(guest.cpu_registers[1]), log_hex(guest.cpu_registers[2]),
+                log_hex(guest.cpu_registers[3]), log_hex(guest.cpu_registers[4]), log_hex(guest.cpu_registers[7]), reason);
+        }
+        std::memcpy(frame.bytes.data(), now, FRAME_WATCH_BYTES);
+    }
 }
 
 bool range_shape_valid(const TtbrRemapRange &range, bool need_user, bool need_perm) {
@@ -480,8 +533,22 @@ EXPORT(int, ttbr_remap_run, uint32_t handle, Ptr<TtbrRemapContext> user_context,
         if (!thread || !thread->cpu)
             return RET_ERROR(TTBR_REMAP_ERR_CORE);
         space->second.run_active = true;
+        if (frame_watch_enabled()) {
+            FrameWatch frame;
+            frame.sp = read_sp(*thread->cpu);
+            if (valid_guest_bytes(emuenv.mem, frame.sp, FRAME_WATCH_BYTES)) {
+                frame.bytes.resize(FRAME_WATCH_BYTES);
+                std::memcpy(frame.bytes.data(), Ptr<const uint8_t>(frame.sp).get(emuenv.mem), FRAME_WATCH_BYTES);
+                frame.skip = { { user_context.address(), uint32_t(sizeof(context)) }, { user_exit.address(), output_size }, { user_options.address(), 12u } };
+                state->frames[thread_id] = std::move(frame);
+            }
+        }
     }
 
+    if (run_trace_enabled(thread_id))
+        LOG_WARN("ttbr_remap RUN_TRACE enter thread={} handle={} pc={} sp={} lr={} cpsr={} host_sp={} host_pc={} host_lr={} quantum={}",
+            thread_id, handle, log_hex(context.r[15]), log_hex(context.r[13]), log_hex(context.r[14]), log_hex(context.cpsr),
+            log_hex(read_sp(*thread->cpu)), log_hex(read_pc(*thread->cpu)), log_hex(read_lr(*thread->cpu)), options.quantum_us);
     // Spaces run concurrently on their own threads; the guest code may block
     // on another lane, so no lock is held while it runs.
     const uint64_t tick_budget = options.quantum_us
@@ -505,7 +572,15 @@ EXPORT(int, ttbr_remap_run, uint32_t handle, Ptr<TtbrRemapContext> user_context,
             space->second.run_active = false;
             space->second.last_context = run.context;
         }
+        if (frame_watch_enabled()) {
+            frame_watch_check(emuenv.mem, *state, thread_id, run.context, int(run.reason));
+            state->frames.erase(thread_id);
+        }
     }
+    if (run_trace_enabled(thread_id))
+        LOG_WARN("ttbr_remap RUN_TRACE exit thread={} handle={} pc={} sp={} lr={} cpsr={} reason={} result={} svc={} fault={}",
+            thread_id, handle, log_hex(run.context.get_pc()), log_hex(run.context.cpu_registers[13]), log_hex(run.context.cpu_registers[14]),
+            log_hex(run.context.cpsr), int(run.reason), run.cpu_result, log_hex(run.svc), log_hex(run.fault_address));
     from_cpu_context(run.context, context);
     context.tpidruro = run.tpidruro;
     context.tpidrurw = run.tpidrurw;
