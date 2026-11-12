@@ -36,7 +36,6 @@
 #include <self.h>
 
 #include <cassert>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -130,16 +129,6 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
     for (size_t i = 0; i < count; ++i) {
         const uint32_t nid = nids[i];
         const Ptr<uint32_t> entry = entries[i];
-
-        if (std::getenv("VITA3K_ACXI_IMPORT_TRACE")) {
-            const char *trace_name = import_name(nid);
-            if (trace_name && std::strstr(trace_name, "sceGxmSetViewport")) {
-                LOG_ERROR("ACXI_IMPORT_TRACE nid={} name={} entry={} words={},{},{},{}",
-                    log_hex(nid), trace_name, log_hex(entry.address()),
-                    log_hex(entry.get(mem)[0]), log_hex(entry.get(mem)[1]),
-                    log_hex(entry.get(mem)[2]), log_hex(entry.get(mem)[3]));
-            }
-        }
 
         if (kernel.debugger.log_imports) {
             const char *const name = import_name(nid);

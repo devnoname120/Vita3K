@@ -1575,20 +1575,6 @@ static void update_viewport(renderer::State &state, SceGxmContext *context) {
 
 EXPORT(void, sceGxmSetDefaultRegionClipAndViewport, SceGxmContext *context, uint32_t xMax, uint32_t yMax) {
     TRACY_FUNC(sceGxmSetDefaultRegionClipAndViewport, context, xMax, yMax);
-    static uint32_t doubledragon_default_clip_trace_count = 0;
-    const char *const doubledragon_clip_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
-    if (doubledragon_clip_trace && doubledragon_clip_trace[0] == '1'
-        && doubledragon_clip_trace[1] == 0 && context
-        && doubledragon_default_clip_trace_count < 128) {
-        std::fprintf(stderr,
-            "VITA3K_DDRG_DEFAULT_CLIP call=%u context=%p active=%u alloc=%u input_max=%u,%u prior_mode=%u prior=%u,%u,%u,%u\n",
-            ++doubledragon_default_clip_trace_count, static_cast<void *>(context),
-            static_cast<unsigned>(context->state.active), static_cast<unsigned>(context->alloc_space.address() != 0),
-            xMax, yMax, static_cast<unsigned>(context->state.region_clip_mode),
-            context->state.region_clip_min.x, context->state.region_clip_min.y,
-            context->state.region_clip_max.x, context->state.region_clip_max.y);
-        std::fflush(stderr);
-    }
     const std::uint32_t xMin = 0;
     const std::uint32_t yMin = 0;
 
@@ -2418,34 +2404,11 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
     }
 
     // set textures that are dirty
-    static uint32_t masseffect_draw_texture_trace_count = 0;
     const gxp::TextureInfo vert_textures_sync = gxm_vertex_program.renderer_data->textures_used & context->is_vert_texture_dirty;
     context->is_vert_texture_dirty &= ~vert_textures_sync;
-    const gxp::TextureInfo frag_textures_dirty = context->is_frag_texture_dirty;
     const gxp::TextureInfo frag_textures_sync = gxm_fragment_program.renderer_data->textures_used & context->is_frag_texture_dirty;
     context->is_frag_texture_dirty &= ~frag_textures_sync;
     const auto &textures = context->state.textures;
-    const char *const masseffect_texture_trace = std::getenv("VITA3K_ME_TEXTURE_SLOT_TRACE");
-    if (masseffect_texture_trace && masseffect_texture_trace[0] == '1'
-        && masseffect_texture_trace[1] == 0 && masseffect_draw_texture_trace_count < 256) {
-        const SceGxmTexture &texture1 = textures[1];
-        const uint32_t width1 = gxm::get_width(texture1);
-        const uint32_t height1 = gxm::get_height(texture1);
-        if (width1 >= 2048 && height1 >= 2048) {
-            const SceGxmTexture &texture0 = textures[0];
-            const uint32_t call = ++masseffect_draw_texture_trace_count;
-            std::fprintf(stderr,
-                "VITA3K_ME_DRAW_TEXTURES call=%u used=0x%04lX dirty=0x%04lX sync=0x%04lX slot0=0x%08X:%08X:%ux%u slot1=0x%08X:%08X:%ux%u\n",
-                call,
-                static_cast<unsigned long>(gxm_fragment_program.renderer_data->textures_used.to_ulong()),
-                static_cast<unsigned long>(frag_textures_dirty.to_ulong()),
-                static_cast<unsigned long>(frag_textures_sync.to_ulong()),
-                texture0.data_addr << 2, static_cast<unsigned>(gxm::get_format(texture0)),
-                gxm::get_width(texture0), gxm::get_height(texture0),
-                texture1.data_addr << 2, static_cast<unsigned>(gxm::get_format(texture1)),
-                width1, height1);
-        }
-    }
     for (uint16_t texture_index = 0; texture_index < SCE_GXM_MAX_TEXTURE_UNITS; texture_index++) {
         if (vert_textures_sync[texture_index]) {
             const uint16_t index_position = SCE_GXM_MAX_TEXTURE_UNITS + texture_index;
@@ -2485,71 +2448,6 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
         stream_used |= (1 << attribute.streamIndex);
     }
 
-    static uint32_t doubledragon_target_draw_trace_count = 0;
-    const char *const doubledragon_draw_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
-    if (doubledragon_draw_trace && doubledragon_draw_trace[0] == '1'
-        && doubledragon_draw_trace[1] == 0 && indexCount == 6
-        && (stream_used & 1u) && max_data_length[0] >= 48
-        && context->state.stream_data[0]
-        && doubledragon_target_draw_trace_count < 128) {
-        const float *const values = context->state.stream_data[0].cast<const float>().get(emuenv.mem);
-        const bool target = values
-            && values[0] == 0.0f && values[1] == 0.0f && values[2] == -80.0f
-            && values[3] == 0.0f && values[4] == -320.0f && values[5] == -80.0f
-            && values[6] == 480.0f && values[7] == -320.0f && values[8] == -80.0f
-            && values[9] == 480.0f && values[10] == 0.0f && values[11] == -80.0f;
-        if (target) {
-            const uint32_t target_call = ++doubledragon_target_draw_trace_count;
-            uint64_t vertex_hash_prefix = 0;
-            std::memcpy(&vertex_hash_prefix, gxm_vertex_program.renderer_data->hash.data(), sizeof(vertex_hash_prefix));
-            std::fprintf(stderr,
-                "VITA3K_DDRG_TARGET_DRAW call=%u context=%p primitive=%u index_type=%u index_count=%u stream0=0x%08X stream0_size=%zu vertex_program=0x%08X vertex_hash=%016llX region_mode=%u region=%u,%u,%u,%u viewport_enable=%u viewport=%g,%g,%g,%g,%g,%g vertices=%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g\n",
-                target_call, static_cast<void *>(context),
-                static_cast<unsigned>(primType), static_cast<unsigned>(indexType), indexCount,
-                context->state.stream_data[0].address(), max_data_length[0],
-                context->state.vertex_program.address(), static_cast<unsigned long long>(vertex_hash_prefix),
-                static_cast<unsigned>(context->state.region_clip_mode),
-                context->state.region_clip_min.x, context->state.region_clip_min.y,
-                context->state.region_clip_max.x, context->state.region_clip_max.y,
-                static_cast<unsigned>(context->state.viewport.enable),
-                context->state.viewport.offset.x, context->state.viewport.offset.y, context->state.viewport.offset.z,
-                context->state.viewport.scale.x, context->state.viewport.scale.y, context->state.viewport.scale.z,
-                values[0], values[1], values[2], values[3], values[4], values[5],
-                values[6], values[7], values[8], values[9], values[10], values[11]);
-            if (target_call <= 4) {
-                for (size_t index = 0; index < gxm_vertex_program.attributes.size(); ++index) {
-                    const auto &attribute = gxm_vertex_program.attributes[index];
-                    std::fprintf(stderr,
-                        "VITA3K_DDRG_TARGET_ATTRIBUTE call=%u index=%zu reg=%u stream=%u offset=%u format=%u components=%u\n",
-                        target_call, index, attribute.regIndex, attribute.streamIndex, attribute.offset,
-                        static_cast<unsigned>(attribute.format), attribute.componentCount);
-                }
-                for (size_t index = 0; index < gxm_vertex_program.streams.size(); ++index) {
-                    const auto &stream = gxm_vertex_program.streams[index];
-                    std::fprintf(stderr,
-                        "VITA3K_DDRG_TARGET_STREAM call=%u index=%zu stride=%u index_source=%u address=0x%08X size=%zu\n",
-                        target_call, index, stream.stride, stream.indexSource,
-                        context->state.stream_data[index].address(), max_data_length[index]);
-                }
-                const auto &uniform_sizes = gxm_vertex_program.renderer_data->uniform_buffer_sizes;
-                for (size_t block = 0; block < uniform_sizes.size(); ++block) {
-                    const UniformBuffer uniform = context->state.vertex_uniform_buffers[block];
-                    const uint32_t float_count = uniform_sizes.at(block);
-                    if (!uniform || !float_count)
-                        continue;
-                    const uint32_t copied_floats = std::min<uint32_t>(float_count, 64);
-                    const uint8_t *const bytes = uniform.cast<const uint8_t>().get(emuenv.mem);
-                    std::fprintf(stderr,
-                        "VITA3K_DDRG_TARGET_UB_SOURCE call=%u block=%zu address=0x%08X floats=%u copied=%u bytes=",
-                        target_call, block, uniform.address(), float_count, copied_floats);
-                    for (uint32_t index = 0; bytes && index < copied_floats * 4; ++index)
-                        std::fprintf(stderr, "%02X", bytes[index]);
-                    std::fputc('\n', stderr);
-                }
-            }
-            std::fflush(stderr);
-        }
-    }
 
     // Copy and queue upload
     for (size_t stream_index = 0; stream_index < SCE_GXM_MAX_VERTEX_STREAMS; ++stream_index) {
@@ -4104,7 +4002,6 @@ EXPORT(void, sceGxmSetFragmentProgram, SceGxmContext *context, Ptr<const SceGxmF
 }
 
 EXPORT(int, sceGxmSetFragmentTexture, SceGxmContext *context, uint32_t textureIndex, const SceGxmTexture *texture) {
-    static uint32_t masseffect_texture_trace_count = 0;
     TRACY_FUNC(sceGxmSetFragmentTexture, context, textureIndex, texture);
     if (!context || !texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4113,22 +4010,6 @@ EXPORT(int, sceGxmSetFragmentTexture, SceGxmContext *context, uint32_t textureIn
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
-    const char *const masseffect_texture_trace = std::getenv("VITA3K_ME_TEXTURE_SLOT_TRACE");
-    if (masseffect_texture_trace && masseffect_texture_trace[0] == '1'
-        && masseffect_texture_trace[1] == 0 && textureIndex < 2
-        && masseffect_texture_trace_count < 512) {
-        const uint32_t width = gxm::get_width(*texture);
-        const uint32_t height = gxm::get_height(*texture);
-        if (width >= 1024 && height >= 1024) {
-            const uint32_t call = ++masseffect_texture_trace_count;
-            std::fprintf(stderr,
-                "VITA3K_ME_SET_FRAGMENT_TEXTURE call=%u slot=%u data=0x%08X format=0x%08X size=%ux%u mips=%u control=%08X,%08X,%08X,%08X\n",
-                call, textureIndex, texture->data_addr << 2, static_cast<unsigned>(gxm::get_format(*texture)),
-                width, height, texture->true_mip_count(),
-                reinterpret_cast<const uint32_t *>(texture)[0], reinterpret_cast<const uint32_t *>(texture)[1],
-                reinterpret_cast<const uint32_t *>(texture)[2], reinterpret_cast<const uint32_t *>(texture)[3]);
-        }
-    }
 
     context->state.textures[textureIndex] = *texture;
     context->is_frag_texture_dirty[textureIndex] = true;
@@ -4306,21 +4187,6 @@ EXPORT(void, sceGxmSetPrecomputedVertexState, SceGxmContext *context, Ptr<SceGxm
 
 EXPORT(void, sceGxmSetRegionClip, SceGxmContext *context, SceGxmRegionClipMode mode, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax) {
     TRACY_FUNC(sceGxmSetRegionClip, context, mode, xMin, yMin, xMax, yMax);
-    static uint32_t doubledragon_region_clip_trace_count = 0;
-    const char *const doubledragon_clip_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
-    if (doubledragon_clip_trace && doubledragon_clip_trace[0] == '1'
-        && doubledragon_clip_trace[1] == 0 && context
-        && doubledragon_region_clip_trace_count < 512) {
-        std::fprintf(stderr,
-            "VITA3K_DDRG_REGION_CLIP call=%u context=%p active=%u alloc=%u input_mode=%u input=%u,%u,%u,%u prior_mode=%u prior=%u,%u,%u,%u\n",
-            ++doubledragon_region_clip_trace_count, static_cast<void *>(context),
-            static_cast<unsigned>(context->state.active), static_cast<unsigned>(context->alloc_space.address() != 0),
-            static_cast<unsigned>(mode), xMin, yMin, xMax, yMax,
-            static_cast<unsigned>(context->state.region_clip_mode),
-            context->state.region_clip_min.x, context->state.region_clip_min.y,
-            context->state.region_clip_max.x, context->state.region_clip_max.y);
-        std::fflush(stderr);
-    }
     bool change_detected = false;
 
     if (context->state.region_clip_mode != mode) {
@@ -4566,22 +4432,6 @@ EXPORT(int, sceGxmSetVertexUniformBuffer, SceGxmContext *context, uint32_t buffe
 
 EXPORT(void, sceGxmSetViewport, SceGxmContext *context, float xOffset, float xScale, float yOffset, float yScale, float zOffset, float zScale) {
     TRACY_FUNC(sceGxmSetViewport, context, xOffset, xScale, yOffset, yScale, zOffset, zScale);
-    static uint32_t doubledragon_viewport_trace_count = 0;
-    const char *const doubledragon_viewport_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
-    if (doubledragon_viewport_trace && doubledragon_viewport_trace[0] == '1'
-        && doubledragon_viewport_trace[1] == 0 && context
-        && doubledragon_viewport_trace_count < 64) {
-        std::fprintf(stderr,
-            "VITA3K_DDRG_GXM_VIEWPORT call=%u context=%p active=%u alloc=%u enable=%u input=%g,%g,%g,%g,%g,%g prior=%g,%g,%g,%g,%g,%g\n",
-            ++doubledragon_viewport_trace_count, static_cast<void *>(context),
-            static_cast<unsigned>(context->state.active), static_cast<unsigned>(context->alloc_space.address() != 0),
-            static_cast<unsigned>(context->state.viewport.enable),
-            xOffset, xScale, yOffset, yScale, zOffset, zScale,
-            context->state.viewport.offset.x, context->state.viewport.scale.x,
-            context->state.viewport.offset.y, context->state.viewport.scale.y,
-            context->state.viewport.offset.z, context->state.viewport.scale.z);
-        std::fflush(stderr);
-    }
     // Set viewport to enable, enable more offset and scale to set
     if (context->state.viewport.offset.x != xOffset || (context->state.viewport.offset.y != yOffset) || (context->state.viewport.offset.z != zOffset)
         || (context->state.viewport.scale.x != xScale) || (context->state.viewport.scale.y != yScale) || (context->state.viewport.scale.z != zScale)) {

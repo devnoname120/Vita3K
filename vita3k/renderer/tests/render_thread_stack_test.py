@@ -23,9 +23,7 @@ def main() -> int:
         'SDL_PROP_THREAD_CREATE_NAME_STRING',
         'SDL_PROP_THREAD_CREATE_USERDATA_POINTER',
         'SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER',
-        'std::strcmp(ttbr_hle_title, "ASPHALT07") == 0',
         '32 * 1024 * 1024',
-        '8 * 1024 * 1024',
         'SDL_CreateThreadWithProperties(properties)',
         'SDL_CreateThread(&render_thread_entry, "Vita3K Renderer", arguments)',
     ):
@@ -36,12 +34,8 @@ def main() -> int:
         'SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER'
     ):
         raise AssertionError("renderer stack override is not title-scoped")
-    if body.index('std::strcmp(ttbr_hle_title, "ASPHALT07") == 0') > body.index(
-        '32 * 1024 * 1024'
-    ):
-        raise AssertionError("Asphalt renderer stack override is not title-specific")
-    if body.index('32 * 1024 * 1024') > body.index('8 * 1024 * 1024'):
-        raise AssertionError("Asphalt renderer stack is not selected before the TTBR fallback")
+    if "ASPHALT07" in body or "8 * 1024 * 1024" in body:
+        raise AssertionError("renderer stack size must not depend on the title")
     if "SDL_Thread *render_thread = nullptr;" not in state:
         raise AssertionError("renderer state does not own the SDL thread")
     if "SDL_WaitThread(state.render_thread, nullptr);" not in batch:

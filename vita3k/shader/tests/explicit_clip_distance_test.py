@@ -66,13 +66,10 @@ def main() -> int:
             raise AssertionError(f"clip-distance store loop is missing {required}")
 
     for draw_source in (scene, gl_draw):
-        required = 'std::getenv("VITA3K_ACXI_FORCE_CLIP_REJECT")'
-        if required not in draw_source:
-            raise AssertionError(f"forced clip rejection control is missing {required}")
-    if "force_clip_reject ? 2.0f" not in scene:
-        raise AssertionError("Vulkan forced clip rejection no longer selects diagnostic mode 2")
-    if "vert_ublock.post_viewport_clip = force_clip_reject ? 2.0f : gl_clip_compat ? 1.0f : 0.0f" not in gl_draw:
-        raise AssertionError("OpenGL forced clip rejection control changed unexpectedly")
+        if "vert_ublock.post_viewport_clip = 0.0f;" not in draw_source:
+            raise AssertionError("draws must leave the post-viewport clip mode off")
+        if "getenv" in draw_source and "VITA3K_ACXI" in draw_source:
+            raise AssertionError("title-specific clip controls are back in a draw path")
     return 0
 
 

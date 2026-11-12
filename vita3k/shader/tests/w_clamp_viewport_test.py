@@ -188,30 +188,12 @@ def main() -> int:
         raise AssertionError("W is clamped after viewport depth division")
 
     shared_draw_requirements = (
-        'const char *const gl_clip_compat_env = std::getenv("VITA3K_ACXI_GL_CLIP_COMPAT")',
-        "const bool gl_clip_compat",
-        "vert_ublock.w_clamp_enabled = gl_clip_compat ? 0.0f : context.record.w_clamp_enabled",
-        "vert_ublock.w_clamp_value",
-        "context.record.w_clamp_value",
-        'std::getenv("VITA3K_ACXI_FORCE_CLIP_REJECT")',
-        "const bool force_clip_reject",
+        "vert_ublock.w_clamp_enabled = context.record.w_clamp_enabled ? 1.0f : 0.0f",
+        "vert_ublock.w_clamp_value = context.record.w_clamp_value",
+        "vert_ublock.post_viewport_clip = 0.0f",
     )
     for source, label in ((gl_draw, "OpenGL draw"), (vk_draw, "Vulkan draw")):
         require(source, shared_draw_requirements, label)
-    require(
-        gl_draw,
-        ("vert_ublock.post_viewport_clip = force_clip_reject ? 2.0f : gl_clip_compat ? 1.0f : 0.0f",),
-        "OpenGL draw",
-    )
-    require(
-        vk_draw,
-        (
-            "force_clip_reject ? 2.0f",
-            "force_clip_plane >= 0 ? 3.0f + static_cast<float>(force_clip_plane)",
-            ": gl_clip_compat ? 1.0f : 0.0f",
-        ),
-        "Vulkan draw",
-    )
     return 0
 
 

@@ -32,12 +32,6 @@ if(NOT ANDROID)
 	find_package(Python3 QUIET COMPONENTS Interpreter)
 	if(Python3_Interpreter_FOUND)
 		add_test(
-			NAME shader-acxi-clip-plane-diagnostic
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/acxi_clip_plane_diagnostic_test.py
-				${CMAKE_SOURCE_DIR}
-		)
-		add_test(
 			NAME shader-literal-input-bit-pattern
 			COMMAND ${Python3_EXECUTABLE}
 				${CMAKE_CURRENT_SOURCE_DIR}/tests/literal_input_bit_pattern_test.py

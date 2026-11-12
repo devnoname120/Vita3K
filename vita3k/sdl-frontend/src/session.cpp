@@ -702,19 +702,6 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
             scripted_input.path = script_path;
         LOG_INFO("Scripted input path='{}'", scripted_input.path);
 
-        const char *capture_setting = std::getenv("VITA3K_WAW_CAPTURE");
-        const bool capture_frames = capture_setting && std::strcmp(capture_setting, "1") == 0;
-        unsigned capture_limit = 24;
-        if (const char *capture_limit_setting = std::getenv("VITA3K_WAW_CAPTURE_LIMIT")) {
-            char *capture_limit_end = nullptr;
-            const unsigned long requested_capture_limit = std::strtoul(capture_limit_setting, &capture_limit_end, 10);
-            if (capture_limit_end != capture_limit_setting && *capture_limit_end == '\0'
-                && requested_capture_limit > 0 && requested_capture_limit <= 3600) {
-                capture_limit = static_cast<unsigned>(requested_capture_limit);
-            }
-        }
-        uint64_t next_capture_tick = SDL_GetTicks() + 5000;
-        unsigned captured_frames = 0;
         const char *const exit_trace_value = std::getenv("VITA3K_SDL_EXIT_TRACE");
         const bool exit_trace = exit_trace_value && *exit_trace_value && std::strcmp(exit_trace_value, "0") != 0;
         const char *exit_reason = pending_launch_request ? "pending-before-loop" : nullptr;
@@ -816,13 +803,6 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
             if (!session.is_running()) {
                 record_exit("session-not-running", 0, 0);
                 running = false;
-            }
-
-            // Capture emulator output without relying on host desktop permissions.
-            if (running && capture_frames && captured_frames < capture_limit && SDL_GetTicks() >= next_capture_tick) {
-                take_screenshot(emuenv);
-                ++captured_frames;
-                next_capture_tick = SDL_GetTicks() + 5000;
             }
 
             if (running)

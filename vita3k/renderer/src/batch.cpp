@@ -33,7 +33,6 @@
 #include <SDL3/SDL_thread.h>
 
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 
 #ifdef TRACY_ENABLE
@@ -319,11 +318,11 @@ static SDL_Thread *create_render_thread(State &state, DisplayState &display,
                 "Vita3K Renderer");
             SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_USERDATA_POINTER,
                 arguments);
-            const Sint64 stack_size = std::strcmp(ttbr_hle_title, "ASPHALT07") == 0
-                ? 32 * 1024 * 1024
-                : 8 * 1024 * 1024;
+            // Deep shader translation recursion can exceed 8 MiB (seen on
+            // Asphalt 7); the stack is reserved address space, so give every
+            // title the same headroom.
             SDL_SetNumberProperty(properties, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER,
-                stack_size);
+                32 * 1024 * 1024);
             thread = SDL_CreateThreadWithProperties(properties);
             SDL_DestroyProperties(properties);
         }

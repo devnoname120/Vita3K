@@ -17,7 +17,7 @@
 
 #include <xxh3.h>
 
-#include "acxi_ring_capacity.h"
+#include "vertex_stream_ring_capacity.h"
 
 #include <renderer/types.h>
 #include <renderer/vulkan/functions.h>
@@ -33,7 +33,7 @@ namespace renderer::vulkan {
 VKContext::VKContext(VKState &state, MemState &mem)
     : state(state)
     , mem(mem)
-    , vertex_stream_ring_buffer(vk::BufferUsageFlagBits::eVertexBuffer, diagnostics::acxi_vertex_stream_ring_capacity_bytes())
+    , vertex_stream_ring_buffer(vk::BufferUsageFlagBits::eVertexBuffer, diagnostics::vertex_stream_ring_capacity_bytes())
     , index_stream_ring_buffer(vk::BufferUsageFlagBits::eIndexBuffer, MiB(64))
     , vertex_uniform_stream_ring_buffer(vk::BufferUsageFlagBits::eStorageBuffer, MiB(/*256*/ 64))
     , fragment_uniform_stream_ring_buffer(vk::BufferUsageFlagBits::eStorageBuffer, MiB(/*256*/ 64))

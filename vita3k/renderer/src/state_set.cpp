@@ -35,9 +35,6 @@
 
 #include <config/state.h>
 
-#include <cstdio>
-#include <cstdlib>
-
 namespace renderer {
 COMMAND_SET_STATE(region_clip) {
     TRACY_FUNC_COMMANDS_SET_STATE(region_clip);
@@ -177,30 +174,12 @@ COMMAND_SET_STATE(viewport) {
         else if (!has_msaa && has_downscale)
             factor = 1.0f;
 
-        const float rawXOffset = helper.pop<float>();
-        const float rawYOffset = helper.pop<float>();
+        const float xOffset = helper.pop<float>() * factor;
+        const float yOffset = helper.pop<float>() * factor;
         const float zOffset = helper.pop<float>();
-        const float rawXScale = helper.pop<float>();
-        const float rawYScale = helper.pop<float>();
+        const float xScale = helper.pop<float>() * factor;
+        const float yScale = helper.pop<float>() * factor;
         const float zScale = helper.pop<float>();
-        const float xOffset = rawXOffset * factor;
-        const float yOffset = rawYOffset * factor;
-        const float xScale = rawXScale * factor;
-        const float yScale = rawYScale * factor;
-
-        static uint32_t doubledragon_viewport_command_trace_count = 0;
-        const char *const doubledragon_viewport_trace = std::getenv("VITA3K_DDRG_VIEWPORT_TRACE");
-        if (doubledragon_viewport_trace && doubledragon_viewport_trace[0] == '1'
-            && doubledragon_viewport_trace[1] == 0
-            && doubledragon_viewport_command_trace_count < 64) {
-            std::fprintf(stderr,
-                "VITA3K_DDRG_VIEWPORT_COMMAND call=%u flat=0 msaa=%u downscale=%u factor=%g raw=%g,%g,%g,%g,%g,%g scaled=%g,%g,%g,%g,%g,%g\n",
-                ++doubledragon_viewport_command_trace_count,
-                static_cast<unsigned>(has_msaa), static_cast<unsigned>(has_downscale), factor,
-                rawXOffset, rawYOffset, zOffset, rawXScale, rawYScale, zScale,
-                xOffset, yOffset, zOffset, xScale, yScale, zScale);
-            std::fflush(stderr);
-        }
 
         const float ymin = yOffset + yScale;
         const float ymax = yOffset - yScale - 1;

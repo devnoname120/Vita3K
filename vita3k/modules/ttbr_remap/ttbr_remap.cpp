@@ -20,9 +20,7 @@
 #include <util/tracy.h>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -167,69 +165,6 @@ bool valid_guest_bytes(const MemState &mem, uint32_t address, uint32_t size) {
         page += PAGE_SIZE;
     }
     return true;
-}
-
-uint32_t acxi_read_u32(const MemState &mem, uint32_t address) {
-    if (!valid_guest_bytes(mem, address, sizeof(uint32_t)))
-        return 0;
-    uint32_t value = 0;
-    std::memcpy(&value, Ptr<const uint8_t>(address).get(mem), sizeof(value));
-    return value;
-}
-
-void acxi_trace_menu_state(const MemState &mem) {
-    static const bool enabled = [] {
-        const char *value = std::getenv("VITA3K_ACXI_MENU_TRACE");
-        return value && *value && std::strcmp(value, "0") != 0;
-    }();
-    if (!enabled)
-        return;
-
-    std::array<uint32_t, 22> current{};
-    current[0] = acxi_read_u32(mem, 0x00112F60u);
-    current[1] = acxi_read_u32(mem, 0x00112F68u);
-    const uint32_t task = acxi_read_u32(mem, 0x00112F5Cu);
-    current[2] = task;
-    current[3] = task ? acxi_read_u32(mem, task + 108u) : 0;
-    const uint32_t manager = acxi_read_u32(mem, 0x00112240u);
-    current[4] = manager;
-    current[5] = manager ? acxi_read_u32(mem, manager) : 0;
-    const uint32_t right = acxi_read_u32(mem, 0x0011303Cu);
-    current[6] = right;
-    current[7] = right ? acxi_read_u32(mem, right) : 0;
-    current[8] = current[7] ? acxi_read_u32(mem, current[7] + 16u) : 0;
-    if (right) {
-        current[9] = acxi_read_u32(mem, right + 36u);
-        current[10] = acxi_read_u32(mem, right + 40u);
-        current[11] = acxi_read_u32(mem, right + 44u);
-        current[12] = acxi_read_u32(mem, right + 48u);
-        current[13] = acxi_read_u32(mem, right + 52u);
-        current[14] = acxi_read_u32(mem, right + 60u);
-    }
-    if (task && current[0] == 12u) {
-        current[15] = acxi_read_u32(mem, task + 200u);
-        current[16] = acxi_read_u32(mem, task + 196u);
-        const uint32_t story = acxi_read_u32(mem, task + 112u);
-        current[17] = story;
-        if (story) {
-            current[18] = acxi_read_u32(mem, story + 40u);
-            current[19] = acxi_read_u32(mem, story + 44u);
-            current[20] = acxi_read_u32(mem, story + 48u);
-            current[21] = acxi_read_u32(mem, story + 60u);
-        }
-    }
-
-    static std::array<uint32_t, 22> previous{};
-    static bool previous_valid = false;
-    if (previous_valid && current == previous)
-        return;
-    previous = current;
-    previous_valid = true;
-    LOG_INFO("ACXI_HLE_MENU current={} next={} task={} state={} manager={} slot0={} right={} vtable={} update={} rb_start={} rb_end={} rb_frame={} rb_play={} rb_flags={} rb_total={} outer={} aux={} story={} st_end={} st_frame={} st_play={} st_total={}",
-        current[0], current[1], log_hex(current[2]), current[3], log_hex(current[4]),
-        log_hex(current[5]), log_hex(current[6]), log_hex(current[7]), log_hex(current[8]),
-        current[9], current[10], current[11], current[12], log_hex(current[13]), current[14],
-        current[15], current[16], log_hex(current[17]), current[18], current[19], current[20], current[21]);
 }
 
 template <typename T>
@@ -574,7 +509,6 @@ EXPORT(int, ttbr_remap_run, uint32_t handle, Ptr<TtbrRemapContext> user_context,
     from_cpu_context(run.context, context);
     context.tpidruro = run.tpidruro;
     context.tpidrurw = run.tpidrurw;
-    acxi_trace_menu_state(emuenv.mem);
 
     std::memset(reinterpret_cast<uint8_t *>(&exit) + sizeof(uint32_t), 0,
         sizeof(exit) - sizeof(uint32_t));

@@ -96,48 +96,10 @@ if(NOT ANDROID)
 				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/scene.cpp
 		)
 		add_test(
-			NAME renderer-vulkan-bloonstd5hd-draw-retry
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_bloonstd5hd_draw_retry_test.py
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/scene.cpp
-		)
-		add_test(
-			NAME renderer-vulkan-acxi-hangar-draw-skip
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_acxi_hangar_draw_skip_test.py
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/scene.cpp
-		)
-		add_test(
-			NAME renderer-vulkan-acxi-hangar-draw-keep
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_acxi_hangar_draw_keep_test.py
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/scene.cpp
-		)
-		add_test(
 			NAME renderer-vulkan-u4u4u4u4-swizzle
 			COMMAND ${Python3_EXECUTABLE}
 				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_u4u4u4u4_swizzle_test.py
 				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/gxm_to_vulkan.cpp
-		)
-		add_test(
-			NAME renderer-vulkan-bounded-draw-probe-limit
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_bounded_draw_probe_limit_test.py
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/bounded_draw_probe.h
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/draw_probe_dump.h
-		)
-		add_test(
-			NAME renderer-vulkan-bounded-draw-probe-vertex-span
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_bounded_draw_probe_vertex_span_test.py
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/draw_probe_dump.h
-		)
-		add_test(
-			NAME renderer-vulkan-bounded-draw-probe-next-frame
-			COMMAND ${Python3_EXECUTABLE}
-				${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_bounded_draw_probe_next_frame_test.py
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/bounded_draw_probe.h
-				${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/draw_probe_dump.h
 		)
 	endif()
 endif()

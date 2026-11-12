@@ -514,24 +514,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
                 precompile_shader(hash, false);
             }
         } else {
-            const char *diagnostic_mode_value = std::getenv("VITA3K_BLOONS_SHADER_DIAG");
-            const std::string diagnostic_mode = diagnostic_mode_value ? diagnostic_mode_value : "";
-            const bool replace_vertex = diagnostic_mode == "vertex" || diagnostic_mode == "both";
-            const bool replace_fragment = diagnostic_mode == "fragment" || diagnostic_mode == "both";
-            const bool diagnostic_vertex = replace_vertex && is_vertex
-                && diagnostic_hash == "58e3c28cf7fcd1902e3019eb26e3852ee3d1c16441bf2222c483c91e0d603758";
-            const bool diagnostic_fragment = replace_fragment && !is_vertex
-                && diagnostic_hash == "48f3df95160b4979e9a4bc1ea86e9a28675f474e22b0dd11417c1c64afc11c5e";
-            if (diagnostic_vertex || diagnostic_fragment) {
-                const fs::path diagnostic_path = diagnostic_vertex
-                    ? "/tmp/bloons_diag_clear.vert.spv"
-                    : "/tmp/bloons_diag_clear.frag.spv";
-                *shader_module = vkutil::load_shader(state.device, diagnostic_path);
-                LOG_WARN("Bloons shader diagnostic: replaced {} shader {} from {}",
-                    diagnostic_vertex ? "vertex" : "fragment", diagnostic_hash, diagnostic_path.string());
-            } else {
-                precompile_shader(hash, false);
-            }
+            precompile_shader(hash, false);
         }
     }
 
@@ -882,22 +865,10 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     const bool two_sided = (record.two_sided == SCE_GXM_TWO_SIDED_ENABLED);
 
     const bool use_shader_interlock = state.features.support_shader_interlock && gxm_fragment_shader->is_frag_color_used();
-    const bool sixty_composite_pair
-        = hex_string(vertex_program.hash) == "1ed37f037294fd954438847fc53eb4eaa1602747c5f5e0262e68a210082f6353"
-        && hex_string(fragment_program.hash) == "eca96fb5d9b62e549a89a583e7c738f1194db271ae81e919deec8845623e220b";
-    const char *const sixty_composite_cull_env = std::getenv("VITA3K_SIXTY_DISABLE_COMPOSITE_CULL");
-    const bool sixty_disable_composite_cull = sixty_composite_pair && sixty_composite_cull_env
-        && sixty_composite_cull_env[0] == '1' && sixty_composite_cull_env[1] == 0;
-    const char *const sixty_composite_depth_stencil_env = std::getenv("VITA3K_SIXTY_DISABLE_COMPOSITE_DEPTH_STENCIL");
-    const bool sixty_disable_composite_depth_stencil = sixty_composite_pair && sixty_composite_depth_stencil_env
-        && sixty_composite_depth_stencil_env[0] == '1' && sixty_composite_depth_stencil_env[1] == 0;
-    const vk::CullModeFlags cull_mode = sixty_disable_composite_cull
-        ? vk::CullModeFlagBits::eNone
-        : translate_cull_mode(record.cull_mode);
 
     const vk::PipelineRasterizationStateCreateInfo rasterizer{
         .polygonMode = translate_polygon_mode(record.front_polygon_mode),
-        .cullMode = cull_mode,
+        .cullMode = translate_cull_mode(record.cull_mode),
         // front face is always counter clockwise
         .frontFace = vk::FrontFace::eCounterClockwise,
         .depthBiasEnable = VK_TRUE,
@@ -909,13 +880,11 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     // depth and stencil tests are always enabled on the ps vita as there is almost no cost in doing so
     // on a tiled renderer
     const vk::PipelineDepthStencilStateCreateInfo ds_info{
-        .depthTestEnable = sixty_disable_composite_depth_stencil ? VK_FALSE : VK_TRUE,
-        .depthWriteEnable = sixty_disable_composite_depth_stencil
-            ? VK_FALSE
-            : (record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED),
+        .depthTestEnable = VK_TRUE,
+        .depthWriteEnable = (record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED),
         .depthCompareOp = translate_depth_func(record.front_depth_func),
         .depthBoundsTestEnable = VK_FALSE,
-        .stencilTestEnable = sixty_disable_composite_depth_stencil ? VK_FALSE : VK_TRUE,
+        .stencilTestEnable = VK_TRUE,
         .front = convert_op_state(record.front_stencil_state_op),
         .back = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op)
     };
