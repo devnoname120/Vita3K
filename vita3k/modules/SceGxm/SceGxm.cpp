@@ -22,9 +22,6 @@
 #include <span>
 #include <stack>
 #include <cstdlib>
-#include <mutex>
-#include <unordered_map>
-#include <vector>
 #if defined(__x86_64__) && !defined(__APPLE__)
 #include <xxh_x86dispatch.h>
 #else
@@ -4574,48 +4571,6 @@ static void free_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShaderP
     free_callbacked(emuenv, thread_id, shaderPatcher, data.address());
 }
 
-static std::mutex archetype_registered_program_mutex;
-static std::unordered_map<Address, Address> archetype_registered_programs;
-
-static bool archetype_registered_program_pages_enabled(const EmuEnvState &emuenv) {
-    const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
-    return requested_title && emuenv.io.title_id == requested_title && emuenv.io.title_id == "ARCH00001";
-}
-
-static void track_archetype_registered_program(Address program, Address patcher) {
-    const std::lock_guard<std::mutex> lock(archetype_registered_program_mutex);
-    archetype_registered_programs[program] = patcher;
-}
-
-static bool free_archetype_registered_program(EmuEnvState &emuenv, Address program) {
-    {
-        const std::lock_guard<std::mutex> lock(archetype_registered_program_mutex);
-        const auto it = archetype_registered_programs.find(program);
-        if (it == archetype_registered_programs.end())
-            return false;
-        archetype_registered_programs.erase(it);
-    }
-    free(emuenv.mem, program);
-    return true;
-}
-
-static void free_archetype_registered_programs(EmuEnvState &emuenv, Address patcher) {
-    std::vector<Address> programs;
-    {
-        const std::lock_guard<std::mutex> lock(archetype_registered_program_mutex);
-        for (auto it = archetype_registered_programs.begin(); it != archetype_registered_programs.end();) {
-            if (it->second == patcher) {
-                programs.push_back(it->first);
-                it = archetype_registered_programs.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (const Address program : programs)
-        free(emuenv.mem, program);
-}
-
 EXPORT(int, sceGxmShaderPatcherAddRefFragmentProgram, SceGxmShaderPatcher *shaderPatcher, SceGxmFragmentProgram *fragmentProgram) {
     TRACY_FUNC(sceGxmShaderPatcherAddRefFragmentProgram, shaderPatcher, fragmentProgram);
     if (!shaderPatcher || !fragmentProgram)
@@ -4779,7 +4734,6 @@ EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) 
     if (!shaderPatcher)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    free_archetype_registered_programs(emuenv, shaderPatcher.address());
     free_callbacked(emuenv, thread_id, shaderPatcher.get(emuenv.mem), shaderPatcher);
 
     return 0;
@@ -4823,8 +4777,7 @@ EXPORT(int, sceGxmShaderPatcherForceUnregisterProgram, SceGxmShaderPatcher *shad
     }
 
     rp->program.reset();
-    if (!free_archetype_registered_program(emuenv, programId.address()))
-        free_callbacked(emuenv, thread_id, shaderPatcher, programId);
+    free_callbacked(emuenv, thread_id, shaderPatcher, programId);
 
     return 0;
 }
@@ -4860,15 +4813,7 @@ EXPORT(Ptr<const SceGxmProgram>, sceGxmShaderPatcherGetProgramFromId, SceGxmShad
         return Ptr<const SceGxmProgram>();
     }
 
-    const Ptr<const SceGxmProgram> program = programId.get(emuenv.mem)->program;
-    const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
-    if (requested_title && emuenv.io.title_id == requested_title && emuenv.io.title_id == "ARCH00001") {
-        static uint32_t archetype_get_program_call = 0;
-        std::fprintf(stderr, "ARCHETYPE_GXM_GET_PROGRAM call=%u id=0x%08X program=0x%08X\n",
-            ++archetype_get_program_call, programId.address(), program.address());
-        std::fflush(stderr);
-    }
-    return program;
+    return programId.get(emuenv.mem)->program;
 }
 
 EXPORT(Ptr<void>, sceGxmShaderPatcherGetUserData, const SceGxmShaderPatcher *shaderPatcher) {
@@ -4899,146 +4844,7 @@ EXPORT(int, sceGxmShaderPatcherRegisterProgram, SceGxmShaderPatcher *shaderPatch
     if (!shaderPatcher || !programHeader || !programId)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    const bool archetype = archetype_registered_program_pages_enabled(emuenv);
-    static uint32_t archetype_register_call = 0;
-    const uint32_t call = archetype ? ++archetype_register_call : 0;
-    const char *const mode = archetype ? std::getenv("VITA3K_ARCHETYPE_GXM_REGISTER_MODE") : nullptr;
-    const char *const target_text = archetype ? std::getenv("VITA3K_ARCHETYPE_GXM_REGISTER_TARGET") : nullptr;
-    const uint32_t target = target_text ? static_cast<uint32_t>(std::strtoul(target_text, nullptr, 0)) : 0;
-    const bool selected = mode && (!target || call >= target);
-    static Ptr<SceGxmRegisteredProgram> archetype_pool;
-    static uint32_t archetype_pool_next = 0;
-    constexpr uint32_t archetype_pool_bytes = 0x1000u;
-    constexpr uint32_t archetype_pool_capacity = archetype_pool_bytes / sizeof(SceGxmRegisteredProgram);
-    const bool reuse_mode = mode && !std::strncmp(mode, "reuse", 5);
-    if (archetype && reuse_mode && call == 1) {
-        archetype_pool = Ptr<SceGxmRegisteredProgram>(alloc_callbacked(
-            emuenv, thread_id, shaderPatcher->params, archetype_pool_bytes));
-        if (!archetype_pool)
-            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_POOL base=0x%08X bytes=0x%X capacity=%u\n",
-            archetype_pool.address(), archetype_pool_bytes, archetype_pool_capacity);
-        std::fflush(stderr);
-    }
-    if (archetype) {
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER call=%u mode=%s target=%u program=0x%08X out=%p\n",
-            call, mode ? mode : "direct", target, programHeader.address(), static_cast<void *>(programId));
-        std::fflush(stderr);
-    }
-    if (selected && !std::strcmp(mode, "noop")) {
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=noop\n", call);
-        std::fflush(stderr);
-        return 0;
-    }
-    if (selected && !std::strcmp(mode, "write")) {
-        *programId = Ptr<SceGxmRegisteredProgram>(0x12345000u);
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=write id=0x%08X\n", call, programId->address());
-        std::fflush(stderr);
-        return 0;
-    }
-    if (selected && !std::strcmp(mode, "alloc-only")) {
-        const Ptr<SceGxmRegisteredProgram> scratch(alloc(emuenv.mem, sizeof(SceGxmRegisteredProgram), "ArchetypeHD shader registration allocation probe"));
-        if (!scratch)
-            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
-        new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-        scratch.get(emuenv.mem)->program = programHeader;
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=alloc-only id=0x%08X\n", call, scratch.address());
-        std::fflush(stderr);
-        return 0;
-    }
-    if (selected && !std::strcmp(mode, "alloc-raw")) {
-        const Ptr<SceGxmRegisteredProgram> scratch(alloc(emuenv.mem, sizeof(SceGxmRegisteredProgram), "ArchetypeHD raw allocation probe"));
-        if (!scratch)
-            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=alloc-raw id=0x%08X\n", call, scratch.address());
-        std::fflush(stderr);
-        return 0;
-    }
-    const bool host_mode = mode && !std::strncmp(mode, "alloc-host-", 11);
-    if (selected && host_mode) {
-        static Ptr<SceGxmRegisteredProgram> scratch;
-        if (call == target) {
-            scratch = Ptr<SceGxmRegisteredProgram>(alloc_aligned(emuenv.mem,
-                sizeof(SceGxmRegisteredProgram), "ArchetypeHD host-page registration probe",
-                emuenv.mem.host_page_size));
-            if (!scratch)
-                return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
-        }
-        const char *action = mode;
-        if (!std::strcmp(mode, "alloc-host-zero")) {
-            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-        } else if (!std::strcmp(mode, "alloc-host-program")) {
-            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-            scratch.get(emuenv.mem)->program = programHeader;
-        } else if (!std::strcmp(mode, "alloc-host-output")) {
-            *programId = scratch;
-        } else if (!std::strcmp(mode, "alloc-host-full")) {
-            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-            scratch.get(emuenv.mem)->program = programHeader;
-            *programId = scratch;
-        } else if (!std::strcmp(mode, "alloc-host-full-clear-output")) {
-            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-            scratch.get(emuenv.mem)->program = programHeader;
-            *programId = scratch;
-            programId->reset();
-        } else if (!std::strcmp(mode, "alloc-host-full-clear-record")) {
-            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-            scratch.get(emuenv.mem)->program = programHeader;
-            *programId = scratch;
-            scratch.get(emuenv.mem)->program.reset();
-        } else if (!std::strcmp(mode, "alloc-host-full-clear-both")) {
-            new (scratch.get(emuenv.mem)) SceGxmRegisteredProgram;
-            scratch.get(emuenv.mem)->program = programHeader;
-            *programId = scratch;
-            scratch.get(emuenv.mem)->program.reset();
-            programId->reset();
-        } else if (std::strcmp(mode, "alloc-host-page")) {
-            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
-        }
-        std::fprintf(stderr,
-            "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=%s id=0x%08X program=0x%08X host_page=0x%X\n",
-            call, action, scratch.address(), programHeader.address(), emuenv.mem.host_page_size);
-        std::fflush(stderr);
-        return 0;
-    }
-    if (selected && reuse_mode) {
-        if (!archetype_pool || archetype_pool_next >= archetype_pool_capacity)
-            return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
-        const Ptr<SceGxmRegisteredProgram> slot(archetype_pool.address()
-            + archetype_pool_next++ * sizeof(SceGxmRegisteredProgram));
-        const char *action = mode;
-        if (!std::strcmp(mode, "reuse-zero")) {
-            new (slot.get(emuenv.mem)) SceGxmRegisteredProgram;
-        } else if (!std::strcmp(mode, "reuse-program")) {
-            new (slot.get(emuenv.mem)) SceGxmRegisteredProgram;
-            slot.get(emuenv.mem)->program = programHeader;
-        } else if (!std::strcmp(mode, "reuse-output")) {
-            *programId = slot;
-        } else if (!std::strcmp(mode, "reuse")) {
-            new (slot.get(emuenv.mem)) SceGxmRegisteredProgram;
-            slot.get(emuenv.mem)->program = programHeader;
-            *programId = slot;
-        } else if (std::strcmp(mode, "reuse-raw")) {
-            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
-        }
-        std::fprintf(stderr, "ARCHETYPE_GXM_REGISTER_SELECTED call=%u action=%s id=0x%08X slot=%u\n",
-            call, action, slot.address(), archetype_pool_next - 1u);
-        std::fflush(stderr);
-        return 0;
-    }
-    if (archetype && !mode) {
-        *programId = Ptr<SceGxmRegisteredProgram>(alloc_aligned(emuenv.mem,
-            sizeof(SceGxmRegisteredProgram), "ArchetypeHD isolated shader registration",
-            emuenv.mem.host_page_size));
-        if (*programId) {
-            new (programId->get(emuenv.mem)) SceGxmRegisteredProgram;
-            const Address patcher_address = Ptr<SceGxmShaderPatcher>(shaderPatcher, emuenv.mem).address();
-            track_archetype_registered_program(programId->address(), patcher_address);
-        }
-        LOG_INFO("ArchetypeHD shader registration isolated id={} program={}", log_hex(programId->address()), log_hex(programHeader.address()));
-    } else {
-        *programId = alloc_callbacked<SceGxmRegisteredProgram>(emuenv, thread_id, shaderPatcher);
-    }
+    *programId = alloc_callbacked<SceGxmRegisteredProgram>(emuenv, thread_id, shaderPatcher);
     assert(*programId);
     if (!*programId) {
         return RET_ERROR(SCE_GXM_ERROR_OUT_OF_MEMORY);
@@ -5118,8 +4924,7 @@ EXPORT(int, sceGxmShaderPatcherUnregisterProgram, SceGxmShaderPatcher *shaderPat
     SceGxmRegisteredProgram *const rp = programId.get(emuenv.mem);
     rp->program.reset();
 
-    if (!free_archetype_registered_program(emuenv, programId.address()))
-        free_callbacked(emuenv, thread_id, shaderPatcher, programId);
+    free_callbacked(emuenv, thread_id, shaderPatcher, programId);
 
     return 0;
 }
