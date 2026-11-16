@@ -17,6 +17,10 @@
 
 #include <module/module.h>
 
+#include <cstdlib>
+#include <cstring>
+
+#include <io/state.h>
 #include <kernel/state.h>
 
 #include "../SceDisplay/SceDisplay.h"
@@ -167,16 +171,38 @@ EXPORT(int, _vshKernelGetCompiledSdkVersionByPid) {
     return UNIMPLEMENTED();
 }
 
+// Kernel plugins whose exports this build provides itself (modules/kubridge,
+// modules/ttbr_remap) are not loaded modules here, yet a title that looks
+// them up before using them must find them. CapUnlocker only lifts a firmware
+// restriction (guest work on the fourth CPU core) that the emulator does not have.
+static bool is_emulated_kernel_plugin(EmuEnvState &emuenv, const char *module_name) {
+    if (strcmp(module_name, "kubridge") == 0 || strcmp(module_name, "CapUnlocker") == 0)
+        return true;
+#ifdef VITA3K_ENABLE_TTBR_REMAP_HLE
+    if (strcmp(module_name, "ttbr_remap") == 0) {
+        // Same rule as the HLE itself (taiHEN.cpp): every title, or only the
+        // one VITA3K_TTBR_REMAP_HLE_TITLE names.
+        const char *const requested_title = std::getenv("VITA3K_TTBR_REMAP_HLE_TITLE");
+        return !requested_title || !*requested_title || emuenv.io.title_id == requested_title;
+    }
+#endif
+    return false;
+}
+
 EXPORT(SceUID, _vshKernelSearchModuleByName, const char *module_name, const void *buffer) {
     TRACY_FUNC(_vshKernelSearchModuleByName, module_name, buffer);
     if (!module_name)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
 
-    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-    for (const auto &[uid, mod] : emuenv.kernel.loaded_modules) {
-        if (strcmp(mod->info.module_name, module_name) == 0)
-            return uid;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &[uid, mod] : emuenv.kernel.loaded_modules) {
+            if (strcmp(mod->info.module_name, module_name) == 0)
+                return uid;
+        }
     }
+    if (is_emulated_kernel_plugin(emuenv, module_name))
+        return 0x7F000001; // any non-negative ID: callers only test for an error
     return RET_ERROR(SCE_KERNEL_ERROR_MODULEMGR_NO_MOD);
 }
 
