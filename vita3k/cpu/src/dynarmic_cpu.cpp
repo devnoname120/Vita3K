@@ -26,7 +26,11 @@
 #include <dynarmic/interface/A32/coprocessor.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <bit>
+#include <vector>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -188,7 +192,28 @@ public:
         LOG_TRACE("{} ({}): {} {}", log_hex(self_), self.parent->thread_id, log_hex(address), disassembly);
     }
 
+    // VITA3K_TRACE_RANGE=lo-hi (hex): log r0-r12, sp, lr at each instruction
+    // executed in [lo, hi), the first 400 times.
+    static void TraceRange(uint64_t self_, uint64_t address, uint64_t) {
+        ArmDynarmicCallback &self = *reinterpret_cast<ArmDynarmicCallback *>(self_);
+        static std::atomic<int> hits{ 0 };
+        if (hits++ >= 400)
+            return;
+        const auto &r = self.cpu->jit->Regs();
+        LOG_ERROR("TRACE_RANGE t={} pc={:08X} r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r8={:08X} r11={:08X} sp={:08X} lr={:08X}",
+            self.parent->thread_id, address, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[8], r[11], r[13], r[14]);
+    }
+
     void PreCodeTranslationHook(bool is_thumb, Dynarmic::A32::VAddr pc, Dynarmic::A32::IREmitter &ir) override {
+        static const std::pair<uint32_t, uint32_t> trace_range = [] {
+            const char *v = std::getenv("VITA3K_TRACE_RANGE");
+            if (!v || !std::strchr(v, '-'))
+                return std::pair<uint32_t, uint32_t>{ 0, 0 };
+            return std::pair<uint32_t, uint32_t>{ static_cast<uint32_t>(std::strtoul(v, nullptr, 16)),
+                static_cast<uint32_t>(std::strtoul(std::strchr(v, '-') + 1, nullptr, 16)) };
+        }();
+        if (pc >= trace_range.first && pc < trace_range.second)
+            ir.CallHostFunction(&TraceRange, ir.Imm64((uint64_t)this), ir.Imm64(pc), ir.Imm64(is_thumb));
         if (cpu->log_code) {
             ir.CallHostFunction(&TraceInstruction, ir.Imm64((uint64_t)this), ir.Imm64(pc), ir.Imm64(is_thumb));
         }
@@ -199,6 +224,7 @@ public:
         Ptr<T> ptr{ addr };
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < KiB(4)) {
             LOG_ERROR("Invalid read of uint{}_t at address: 0x{:x}\n{}", sizeof(T) * 8, addr, this->cpu->save_context().description());
+            log_crash_memory(this->cpu->save_context());
 
             auto pc = this->cpu->get_pc();
             if (pc < KiB(4))
@@ -236,6 +262,7 @@ public:
         Ptr<T> ptr{ addr };
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < KiB(4)) {
             LOG_ERROR("Invalid write of uint{}_t at addr: 0x{:x}, val = 0x{:x}\n{}", sizeof(T) * 8, addr, value, this->cpu->save_context().description());
+            log_crash_memory(this->cpu->save_context());
 
             auto pc = this->cpu->get_pc();
             if (pc < KiB(4))
@@ -273,6 +300,7 @@ public:
         Ptr<T> ptr{ addr };
         if (!ptr || !ptr.valid(*parent->mem) || ptr.address() < KiB(4)) {
             LOG_ERROR("Invalid exclusive write of uint{}_t at addr: 0x{:x}, val = 0x{:x}, expected = 0x{:x}\n{}", sizeof(T) * 8, addr, value, expected, this->cpu->save_context().description());
+            log_crash_memory(this->cpu->save_context());
 
             auto pc = this->cpu->get_pc();
             if (pc < KiB(4))
@@ -306,7 +334,67 @@ public:
     }
 
     void InterpreterFallback(Dynarmic::A32::VAddr addr, size_t num_insts) override {
-        LOG_ERROR("Unimplemented instruction at address {}:\n{}", log_hex(addr), save_context(*parent).description());
+        CPUContext context = save_context(*parent);
+        LOG_ERROR("Unimplemented instruction at address {}:\n{}", log_hex(addr), context.description());
+        log_crash_memory(context);
+    }
+
+    // A guest that jumps through a bad pointer lands here: show what the
+    // registers point at (an object, its vtable) and the top of the stack,
+    // the first few times on each thread.
+    void log_crash_memory(const CPUContext &context) {
+        thread_local int dumps = 0;
+        if (dumps++ >= 2)
+            return;
+        auto words = [&](uint32_t base, int count) {
+            std::string out;
+            for (int i = 0; i < count; i++) {
+                const uint32_t a = base + i * 4;
+                if (!is_valid_addr(*parent->mem, a) || !is_valid_addr(*parent->mem, a + 3))
+                    break;
+                out += fmt::format(" {:08X}", *Ptr<uint32_t>(a).get(*parent->mem));
+            }
+            return out;
+        };
+        for (int r = 0; r < 15; r++) {
+            const uint32_t v = context.cpu_registers[r];
+            if (v < 0x1000 || !is_valid_addr(*parent->mem, v))
+                continue;
+            std::string line = fmt::format("CRASH_MEM r{}={:08X}:{}", r, v, words(v & ~3u, r == 13 ? 64 : 8));
+            const uint32_t first = *Ptr<uint32_t>(v & ~3u).get(*parent->mem);
+            if (r != 13 && first >= 0x1000 && is_valid_addr(*parent->mem, first))
+                line += fmt::format(" | [{:08X}]:{}", first, words(first & ~3u, 8));
+            LOG_ERROR("{}", line);
+        }
+        // Extra addresses to show, from VITA3K_CRASH_DUMP (comma-separated hex).
+        if (const char *extra = std::getenv("VITA3K_CRASH_DUMP")) {
+            std::string list(extra);
+            size_t pos = 0;
+            while (pos < list.size()) {
+                const size_t end = list.find(',', pos);
+                const uint32_t a = static_cast<uint32_t>(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16));
+                if (a && is_valid_addr(*parent->mem, a))
+                    LOG_ERROR("CRASH_MEM {:08X}:{}", a, words(a & ~3u, 8));
+                if (end == std::string::npos)
+                    break;
+                pos = end + 1;
+            }
+        }
+        // What the frames above point at: each stack word that is a valid
+        // non-code address (locals, `this`, vectors), once.
+        const uint32_t sp = context.cpu_registers[13];
+        std::vector<uint32_t> seen;
+        for (int i = 0; i < 48; i++) {
+            const uint32_t a = sp + i * 4;
+            if (!is_valid_addr(*parent->mem, a))
+                break;
+            const uint32_t v = *Ptr<uint32_t>(a).get(*parent->mem);
+            if (v < 0x81000000u || (v & 3) || !is_valid_addr(*parent->mem, v)
+                || std::find(seen.begin(), seen.end(), v) != seen.end())
+                continue;
+            seen.push_back(v);
+            LOG_ERROR("CRASH_MEM [sp+0x{:X}]={:08X}:{}", i * 4, v, words(v, 12));
+        }
     }
 
     void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception exception) override {

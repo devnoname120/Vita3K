@@ -628,3 +628,184 @@ index bac8d9c9..ed281ce0 100644
  }
  #else
  #    error "Invalid architecture"
+diff --git a/src/dynarmic/frontend/A32/decoder/asimd.inc b/src/dynarmic/frontend/A32/decoder/asimd.inc
+index d0dfd867..e155a645 100644
+--- a/src/dynarmic/frontend/A32/decoder/asimd.inc
++++ b/src/dynarmic/frontend/A32/decoder/asimd.inc
+@@ -59,21 +59,19 @@ INST(v8_SHA256SU1,          "SHA256SU1",                "111100110D10nnnndddd110
+ // Three registers of different lengths
+ INST(asimd_VADDL,           "VADDL/VADDW",              "1111001U1Dzznnnndddd000oN0M0mmmm") // ASIMD
+ INST(asimd_VSUBL,           "VSUBL/VSUBW",              "1111001U1Dzznnnndddd001oN0M0mmmm") // ASIMD
+-//INST(asimd_VADDHN,          "VADDHN",                   "111100101-----------0100-0-0----") // ASIMD
+-//INST(asimd_VRADDHN,         "VRADDHN",                  "111100111-----------0100-0-0----") // ASIMD
++INST(asimd_VADDHN,            "VADDHN/VRADDHN",           "1111001U1Dzznnnndddd0100N0M0mmmm") // ASIMD
+ INST(asimd_VABAL,           "VABAL",                    "1111001U1Dzznnnndddd0101N0M0mmmm") // ASIMD
+-//INST(asimd_VSUBHN,          "VSUBHN",                   "111100101-----------0110-0-0----") // ASIMD
+-//INST(asimd_VRSUBHN,         "VRSUBHN",                  "111100111-----------0110-0-0----") // ASIMD
++INST(asimd_VSUBHN,            "VSUBHN/VRSUBHN",           "1111001U1Dzznnnndddd0110N0M0mmmm") // ASIMD
+ INST(asimd_VABDL,           "VABDL",                    "1111001U1Dzznnnndddd0111N0M0mmmm") // ASIMD
+ INST(asimd_VMLAL,           "VMLAL/VMLSL",              "1111001U1Dzznnnndddd10o0N0M0mmmm") // ASIMD
+-//INST(asimd_VQDMLAL,         "VQDMLAL",                  "111100101-----------10-1-0-0----") // ASIMD
++INST(asimd_VQDMLAL,           "VQDMLAL/VQDMLSL",          "111100101Dzznnnndddd10o1N0M0mmmm") // ASIMD
+ INST(asimd_VMULL,           "VMULL",                    "1111001U1Dzznnnndddd11P0N0M0mmmm") // ASIMD
+-//INST(asimd_VQDMULL,         "VQDMULL",                  "111100101-----------1101-0-0----") // ASIMD
++INST(asimd_VQDMULL,           "VQDMULL",                  "111100101Dzznnnndddd1101N0M0mmmm") // ASIMD
+ 
+ // Two registers and a scalar
+ INST(asimd_VMLA_scalar,     "VMLA (scalar)",            "1111001Q1Dzznnnndddd0o0FN1M0mmmm") // ASIMD
+ INST(asimd_VMLAL_scalar,    "VMLAL (scalar)",           "1111001U1dzznnnndddd0o10N1M0mmmm") // ASIMD
+-//INST(asimd_VQDMLAL_scalar,  "VQDMLAL/VQDMLSL (scalar)", "111100101-BB--------0x11-1-0----") // ASIMD
++INST(asimd_VQDMLAL_scalar,    "VQDMLAL/VQDMLSL (scalar)", "111100101Dzznnnndddd0o11N1M0mmmm") // ASIMD
+ INST(asimd_VMUL_scalar,     "VMUL (scalar)",            "1111001Q1Dzznnnndddd100FN1M0mmmm") // ASIMD
+ INST(asimd_VMULL_scalar,    "VMULL (scalar)",           "1111001U1Dzznnnndddd1010N1M0mmmm") // ASIMD
+ INST(asimd_VQDMULL_scalar,  "VQDMULL (scalar)",         "111100101Dzznnnndddd1011N1M0mmmm") // ASIMD
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index 44ac2450..bb7f6649 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -892,12 +892,17 @@ struct TranslatorVisitor final {
+     bool asimd_VABDL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VMLAL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
+     bool asimd_VMULL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool P, bool N, bool M, size_t Vm);
++    bool asimd_VQDMLAL(bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
++    bool asimd_VADDHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
++    bool asimd_VSUBHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
++    bool asimd_VQDMULL(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+ 
+     // Advanced SIMD two registers and a scalar
+     bool asimd_VMLA_scalar(bool Q, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool F, bool N, bool M, size_t Vm);
+     bool asimd_VMLAL_scalar(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
+     bool asimd_VMUL_scalar(bool Q, bool D, size_t sz, size_t Vn, size_t Vd, bool F, bool N, bool M, size_t Vm);
+     bool asimd_VMULL_scalar(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
++    bool asimd_VQDMLAL_scalar(bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
+     bool asimd_VQDMULL_scalar(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VQDMULH_scalar(bool Q, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VQRDMULH_scalar(bool Q, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+diff --git a/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp b/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
+index a69f39bf..d643af97 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
+@@ -970,4 +970,88 @@ bool TranslatorVisitor::asimd_VMULL(bool U, bool D, size_t sz, size_t Vn, size_t
+     return true;
+ }
+ 
++// Saturating doubling multiply long, with saturating accumulate (VQDMLAL) or
++// subtract (VQDMLSL): Qd = sat(Qd +/- sat(2 * Dn * Dm)).
++bool TranslatorVisitor::asimd_VQDMLAL(bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
++    if (sz == 0b11) {
++        return DecodeError();
++    }
++
++    if (sz == 0b00 || mcl::bit::get_bit<0>(Vd)) {
++        return UndefinedInstruction();
++    }
++
++    const size_t esize = 8U << sz;
++    const auto d = ToVector(true, Vd, D);
++    const auto m = ToVector(false, Vm, M);
++    const auto n = ToVector(false, Vn, N);
++
++    const auto product = ir.VectorSignedSaturatedDoublingMultiplyLong(esize, ir.GetVector(n), ir.GetVector(m));
++    const auto reg_d = ir.GetVector(d);
++    const auto result = op ? ir.VectorSignedSaturatedSub(esize * 2, reg_d, product)
++                           : ir.VectorSignedSaturatedAdd(esize * 2, reg_d, product);
++
++    ir.SetVector(d, result);
++    return true;
++}
++
++bool TranslatorVisitor::asimd_VQDMULL(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
++    if (sz == 0b11) {
++        return DecodeError();
++    }
++
++    if (sz == 0b00 || mcl::bit::get_bit<0>(Vd)) {
++        return UndefinedInstruction();
++    }
++
++    const size_t esize = 8U << sz;
++    const auto d = ToVector(true, Vd, D);
++    const auto m = ToVector(false, Vm, M);
++    const auto n = ToVector(false, Vn, N);
++
++    ir.SetVector(d, ir.VectorSignedSaturatedDoublingMultiplyLong(esize, ir.GetVector(n), ir.GetVector(m)));
++    return true;
++}
++
++namespace {
++// Add or subtract quadwords, keep the high half of each element, narrow into a
++// doubleword (VADDHN/VSUBHN); U rounds first (VRADDHN/VRSUBHN).
++bool NarrowingHighHalf(TranslatorVisitor& v, bool round, bool subtract, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
++    if (sz == 0b11) {
++        return v.DecodeError();
++    }
++
++    if (mcl::bit::get_bit<0>(Vn) || mcl::bit::get_bit<0>(Vm)) {
++        return v.UndefinedInstruction();
++    }
++
++    const size_t esize = 8U << sz;
++    const auto d = ToVector(false, Vd, D);
++    const auto n = ToVector(true, Vn, N);
++    const auto m = ToVector(true, Vm, M);
++
++    const auto reg_n = v.ir.GetVector(n);
++    const auto reg_m = v.ir.GetVector(m);
++    auto wide = subtract ? v.ir.VectorSub(esize * 2, reg_n, reg_m) : v.ir.VectorAdd(esize * 2, reg_n, reg_m);
++    if (round) {
++        const u64 half = u64(1) << (esize - 1);
++        const auto bias = esize == 8    ? v.ir.VectorBroadcast(16, v.ir.Imm16(static_cast<u16>(half)))
++                          : esize == 16 ? v.ir.VectorBroadcast(32, v.ir.Imm32(static_cast<u32>(half)))
++                                        : v.ir.VectorBroadcast(64, v.ir.Imm64(half));
++        wide = v.ir.VectorAdd(esize * 2, wide, bias);
++    }
++    const auto high = v.ir.VectorLogicalShiftRight(esize * 2, wide, static_cast<u8>(esize));
++    v.ir.SetVector(d, v.ir.VectorNarrow(esize * 2, high));
++    return true;
++}
++}  // Anonymous namespace
++
++bool TranslatorVisitor::asimd_VADDHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
++    return NarrowingHighHalf(*this, U, false, D, sz, Vn, Vd, N, M, Vm);
++}
++
++bool TranslatorVisitor::asimd_VSUBHN(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
++    return NarrowingHighHalf(*this, U, true, D, sz, Vn, Vd, N, M, Vm);
++}
++
+ }  // namespace Dynarmic::A32
+diff --git a/src/dynarmic/frontend/A32/translate/impl/asimd_two_regs_scalar.cpp b/src/dynarmic/frontend/A32/translate/impl/asimd_two_regs_scalar.cpp
+index 8d1876a0..3d633ac6 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/asimd_two_regs_scalar.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/asimd_two_regs_scalar.cpp
+@@ -155,6 +155,30 @@ bool TranslatorVisitor::asimd_VMULL_scalar(bool U, bool D, size_t sz, size_t Vn,
+     return ScalarMultiplyLong(*this, U, D, sz, Vn, Vd, N, M, Vm, MultiplyBehavior::Multiply);
+ }
+ 
++bool TranslatorVisitor::asimd_VQDMLAL_scalar(bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
++    if (sz == 0b11) {
++        return DecodeError();
++    }
++
++    if (sz == 0b00 || mcl::bit::get_bit<0>(Vd)) {
++        return UndefinedInstruction();
++    }
++
++    const size_t esize = 8U << sz;
++    const auto d = ToVector(true, Vd, D);
++    const auto n = ToVector(false, Vn, N);
++    const auto [m, index] = GetScalarLocation(esize, M, Vm);
++
++    const auto reg_m = ir.VectorBroadcastElement(esize, ir.GetVector(m), index);
++    const auto product = ir.VectorSignedSaturatedDoublingMultiplyLong(esize, ir.GetVector(n), reg_m);
++    const auto reg_d = ir.GetVector(d);
++    const auto result = op ? ir.VectorSignedSaturatedSub(esize * 2, reg_d, product)
++                           : ir.VectorSignedSaturatedAdd(esize * 2, reg_d, product);
++
++    ir.SetVector(d, result);
++    return true;
++}
++
+ bool TranslatorVisitor::asimd_VQDMULL_scalar(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+     if (sz == 0b11) {
+         return DecodeError();
