@@ -163,7 +163,7 @@ index 6b38c410..896fb7aa 100644
  HaltReason Jit::Run() {
      return impl->Run();
 diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
-index 2c7ae777..2cd2b44f 100644
+index 2c7ae777..6d5f01d1 100644
 --- a/src/dynarmic/backend/arm64/address_space.cpp
 +++ b/src/dynarmic/backend/arm64/address_space.cpp
 @@ -4,6 +4,9 @@
@@ -223,6 +223,22 @@ index 2c7ae777..2cd2b44f 100644
  
  CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
      if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
+@@ -345,9 +377,12 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+     }
+ 
+ fail:
+-    fmt::print("dynarmic: Segfault happened within JITted code at host_pc = {:016x}\n", host_pc);
+-    fmt::print("Segfault wasn't at a fastmem patch location!\n");
+-    ASSERT_FALSE("segfault");
++    // Not a fastmem access: with a page table (no fastmem patches) every
++    // guest access the host traps lands here, e.g. a store to a page the
++    // embedder write-protects to track changes. Decline it (call_pc 0): the
++    // exception handler reports failure, the host raises the signal, the
++    // embedder's handler unprotects the page and the access runs again.
++    return FakeCall{0};
+ }
+ 
+ }  // namespace Dynarmic::Backend::Arm64
 diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
 index 5115fbbb..ad433259 100644
 --- a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
@@ -384,7 +400,7 @@ index 5115fbbb..ad433259 100644
      }
  
 diff --git a/src/dynarmic/backend/exception_handler_macos.cpp b/src/dynarmic/backend/exception_handler_macos.cpp
-index bac8d9c9..ed281ce0 100644
+index bac8d9c9..d23c294a 100644
 --- a/src/dynarmic/backend/exception_handler_macos.cpp
 +++ b/src/dynarmic/backend/exception_handler_macos.cpp
 @@ -4,8 +4,12 @@
@@ -455,7 +471,18 @@ index bac8d9c9..ed281ce0 100644
      mach_port_deallocate(mach_task_self(), server_port);
  }
  
-@@ -154,7 +185,21 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
+@@ -130,6 +161,10 @@ void MachHandler::MessagePump() {
+     }
+ }
+ 
++// Set when the fastmem callback declined a fault in JIT code (one exception
++// is served at a time by the handler thread).
++static bool declined_fault = false;
++
+ #if defined(MCL_ARCHITECTURE_X86_64)
+ kern_return_t MachHandler::HandleRequest(x86_thread_state64_t* ts) {
+     std::lock_guard<std::mutex> guard(code_block_infos_mutex);
+@@ -154,11 +189,30 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
  
      const auto iter = FindCodeBlockInfo(ts->__pc);
      if (iter == code_block_infos.end()) {
@@ -478,7 +505,16 @@ index bac8d9c9..ed281ce0 100644
          return KERN_FAILURE;
      }
  
-@@ -169,18 +214,43 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
+     FakeCall fc = iter->cb(ts->__pc);
++    if (!fc.call_pc) {
++        // Declined (not a fastmem access): leave it to the signal handler.
++        declined_fault = true;
++        return KERN_FAILURE;
++    }
+ 
+     // TODO: Sign with ptrauth_sign_unauthenticated if pointer authentication is enabled.
+     ts->__pc = fc.call_pc;
+@@ -169,18 +223,43 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
  
  void MachHandler::AddCodeBlock(CodeBlockInfo cbi) {
      std::lock_guard<std::mutex> guard(code_block_infos_mutex);
@@ -523,7 +559,7 @@ index bac8d9c9..ed281ce0 100644
      code_block_infos.erase(iter);
  }
  
-@@ -209,8 +279,8 @@ mig_external kern_return_t catch_mach_exception_raise_state_identity(mach_port_t
+@@ -209,8 +288,8 @@ mig_external kern_return_t catch_mach_exception_raise_state_identity(mach_port_t
  mig_external kern_return_t catch_mach_exception_raise_state(
      mach_port_t /*exception_port*/,
      exception_type_t exception,
@@ -534,11 +570,14 @@ index bac8d9c9..ed281ce0 100644
      int* flavor,
      const thread_state_t old_state,
      mach_msg_type_number_t old_stateCnt,
-@@ -235,32 +305,74 @@ mig_external kern_return_t catch_mach_exception_raise_state(
+@@ -233,34 +312,77 @@ mig_external kern_return_t catch_mach_exception_raise_state(
+     dynarmic_thread_state_t ts;
+     std::memcpy(&ts, old_state, sizeof(ts));
  
++    declined_fault = false;
      kern_return_t ret = mach_handler->HandleRequest(&ts);
  
-+    if (ret != KERN_SUCCESS) {
++    if (ret != KERN_SUCCESS && !declined_fault) {
 +        const u64 exception_code = codeCnt > 0 ? code[0] : 0;
 +        const u64 fault_address = codeCnt > 1 ? code[1] : 0;
 +        fmt::print(stderr,
@@ -612,7 +651,7 @@ index bac8d9c9..ed281ce0 100644
  };
  
  ExceptionHandler::ExceptionHandler() = default;
-@@ -270,13 +382,13 @@ ExceptionHandler::~ExceptionHandler() = default;
+@@ -270,13 +392,13 @@ ExceptionHandler::~ExceptionHandler() = default;
  void ExceptionHandler::Register(X64::BlockOfCode& code) {
      const u64 code_begin = mcl::bit_cast<u64>(code.getCode());
      const u64 code_end = code_begin + code.GetTotalCodeSize();
